@@ -17,6 +17,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/csv"
 	"encoding/json"
 	"flag"
@@ -34,11 +35,15 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"text/tabwriter"
 	"time"
 
 	"github.com/oarkflow/bcl"
+	xql "github.com/oarkflow/xql"
 	"github.com/zrep/zrep/internal/matcher"
 	"github.com/zrep/zrep/internal/output"
+	"github.com/zrep/zrep/internal/query"
+	"github.com/zrep/zrep/internal/records"
 	"github.com/zrep/zrep/internal/searcher"
 	"github.com/zrep/zrep/internal/walker"
 )
@@ -96,6 +101,14 @@ var (
 	flagBoolean           = flag.Bool("boolean", false, "parse pattern as a boolean expression")
 	flagSemantic          = flag.Bool("semantic", false, "use local lexical semantic matching")
 	flagLogs              = flag.Bool("logs", false, "parse lines as logs for time filtering and aggregation")
+	flagActivity          = flag.String("activity", "", "filter log records by activity/action")
+	flagUserID            = flag.String("user-id", "", "filter log records by user_id")
+	flagEmail             = flag.String("email", "", "filter log records by email")
+	flagIP                = flag.String("ip", "", "filter log records by ip address")
+	flagSessionID         = flag.String("session-id", "", "filter log records by session_id")
+	flagRequestID         = flag.String("request-id", "", "filter log records by request_id")
+	flagQuery             = flag.String("query", "", "filter records with a boolean field expression")
+	flagXQL               = flag.String("xql", "", "filter records with an XQL-style expression")
 	flagSince             = flag.String("since", "", "only include logs since duration or time")
 	flagFrom              = flag.String("from", "", "only include logs from time")
 	flagTo                = flag.String("to", "", "only include logs until time")
@@ -106,6 +119,10 @@ var (
 	flagProfileData       = flag.Bool("profile-data", false, "profile structured data")
 	flagJQ                = flag.String("jq", "", "filter JSON/JSONL with a small FIELD==VALUE expression")
 	flagSQL               = flag.String("sql", "", "query CSV/JSONL with a small SELECT ... WHERE ... expression")
+	flagSQLFiles          = flag.Bool("sql-files", false, "search SQL files and print matching SQL blocks")
+	flagSQLBlock          = flag.String("sql-block", "statement", "SQL block mode: statement, context, object, all")
+	flagSQLContext        = flag.Int("sql-context", 2, "context lines for --sql-block context")
+	flagSQLKind           = flag.String("sql-kind", "", "filter SQL blocks by kind")
 	flagOutput            = flag.String("output", "", "alias for -format in inspect/data modes")
 	flagTUI               = flag.Bool("tui", false, "open interactive terminal UI")
 	flagJSONEvents        = flag.Bool("json-events", false, "print ripgrep-style JSON event records")
@@ -149,6 +166,7 @@ var (
 	flagTypeExcludes      patternList
 	flagTypeAdds          patternList
 	flagIgnoreFiles       patternList
+	flagFields            patternList
 )
 
 type zrepBCLConfig struct {
@@ -176,6 +194,7 @@ Flags:
 	flag.Var(&flagIncludes, "include", "include only files matching glob; may be repeated")
 	flag.Var(&flagExcludes, "exclude", "exclude files or directories matching glob; may be repeated")
 	flag.Var(&flagIgnoreFiles, "ignore-file", "read ignore globs from file; may be repeated")
+	flag.Var(&flagFields, "field", "filter records by KEY=VALUE; may be repeated")
 	flag.Var(&flagIncludeDirs, "include-dir", "include only files under matching directories; may be repeated")
 	flag.Var(&flagExcludeDirs, "exclude-dir", "exclude directories matching glob; may be repeated")
 	flag.Var(&flagTypes, "t", "include files of type (go, js, ts, py, rust, java, c, cpp, md, json); may be repeated")
@@ -216,7 +235,7 @@ Flags:
 		printTypeList()
 		return
 	}
-	if hasDataOperation() {
+	if !*flagLogs && !*flagSQLFiles && hasDataOperation() {
 		if *flagSample == 0 && flagLookupChanged("limit") {
 			*flagSample = *flagLimit
 		}
@@ -243,7 +262,7 @@ Flags:
 		fmt.Fprintf(os.Stderr, "zrep: %v\n", err)
 		os.Exit(2)
 	}
-	if len(args) < 1 && len(flagPatterns) == 0 {
+	if len(args) < 1 && len(flagPatterns) == 0 && !recordModeAllowsNoPattern() {
 		flag.Usage()
 		os.Exit(2)
 	}
@@ -251,8 +270,17 @@ Flags:
 	patterns := []string(flagPatterns)
 	roots := args
 	if len(patterns) == 0 {
-		patterns = []string{args[0]}
-		roots = args[1:]
+		if recordModeAllowsNoPattern() && hasRecordFilters() {
+			if len(args) > 1 {
+				patterns = []string{args[0]}
+				roots = args[1:]
+			} else {
+				roots = args
+			}
+		} else {
+			patterns = []string{args[0]}
+			roots = args[1:]
+		}
 	}
 	if len(roots) == 0 {
 		if stdinIsPipe() {
@@ -264,8 +292,12 @@ Flags:
 	if *flagSmartCase && !*flagIgnoreCase && allLowerPatterns(patterns) {
 		*flagIgnoreCase = true
 	}
-	if *flagLogs && (*flagGroupBy != "" || *flagHistogram != "") {
-		runLogSummary(patterns, roots)
+	if *flagLogs {
+		runRecordLogs(patterns, roots)
+		return
+	}
+	if *flagSQLFiles {
+		runSQLFileSearch(patterns, roots)
 		return
 	}
 
@@ -1113,13 +1145,15 @@ func flagsWithValues() map[string]bool {
 		"A": true, "B": true, "C": true, "E": true, "N": true,
 		"T": true, "e": true, "f": true, "g": true, "j": true, "m": true, "r": true, "t": true,
 		"cell-width": true,
-		"config":     true, "config-id": true, "cpuprofile": true, "distance": true, "encoding": true, "exclude": true,
-		"exclude-dir": true, "file": true, "format": true, "glob": true, "include": true,
-		"from": true, "group-by": true, "histogram": true, "ignore-file": true, "include-dir": true, "jq": true,
+		"activity":   true, "config": true, "config-id": true, "cpuprofile": true, "distance": true, "email": true,
+		"encoding": true, "exclude": true,
+		"exclude-dir": true, "field": true, "file": true, "format": true, "glob": true, "include": true,
+		"from": true, "group-by": true, "histogram": true, "ignore-file": true, "include-dir": true, "ip": true, "jq": true,
 		"limit": true, "max-columns": true, "max-filesize": true,
 		"max-cell-width": true, "max-count": true, "output": true, "path-separator": true, "profile": true, "replace": true,
-		"sample": true, "select": true, "since": true, "sort": true, "sortr": true, "sql": true,
-		"to": true, "type-add": true, "where": true,
+		"query": true, "request-id": true, "sample": true, "select": true, "session-id": true, "since": true,
+		"sort": true, "sortr": true, "sql": true, "sql-block": true, "sql-context": true, "sql-kind": true,
+		"to": true, "type-add": true, "user-id": true, "where": true, "xql": true,
 	}
 }
 
@@ -1221,6 +1255,16 @@ func hasInspectOperation() bool {
 
 func hasDataOperation() bool {
 	return hasInspectOperation() || *flagSchema || *flagProfileData || *flagJQ != "" || *flagSQL != ""
+}
+
+func recordModeAllowsNoPattern() bool {
+	return *flagLogs || *flagSQLFiles
+}
+
+func hasRecordFilters() bool {
+	return *flagActivity != "" || *flagUserID != "" || *flagEmail != "" || *flagIP != "" ||
+		*flagSessionID != "" || *flagRequestID != "" || *flagQuery != "" || *flagXQL != "" ||
+		len(flagFields) > 0 || *flagSQLKind != "" || *flagGroupBy != "" || *flagHistogram != ""
 }
 
 func runStateCommand(args []string) bool {
@@ -1706,51 +1750,222 @@ func fieldValue(obj map[string]any, field string) any {
 	return cur
 }
 
-func runLogSummary(patterns, roots []string) {
-	needle := ""
-	if len(patterns) > 0 {
-		needle = patterns[0]
+func runRecordLogs(patterns, roots []string) {
+	pred, err := buildRecordPredicate()
+	if err != nil {
+		fatal(err)
 	}
-	counts := map[string]int{}
+	var out []records.Record
 	for _, entry := range collectEntries(roots, runtime.GOMAXPROCS(0)*2) {
-		f, err := os.Open(entry.Path)
+		recs, err := records.ReadLogRecords(entry.Path)
 		if err != nil {
+			if !*flagNoMessages {
+				fmt.Fprintf(os.Stderr, "zrep: %v\n", err)
+			}
 			continue
 		}
-		sc := bufio.NewScanner(f)
-		for sc.Scan() {
-			line := sc.Text()
-			if needle != "" && !strings.Contains(line, needle) {
+		for _, rec := range recs {
+			if !recordTimeInRange(rec.Fields["timestamp"]) || !recordMatchesPattern(rec, patterns) || !pred.Match(rec.Fields) {
 				continue
 			}
-			if !logLineInRange(line) {
-				continue
-			}
-			key := "matches"
-			if *flagHistogram != "" {
-				key = histogramBucket(line, *flagHistogram)
-			} else if *flagGroupBy != "" {
-				key = logField(line, *flagGroupBy)
-			}
-			if key == "" {
-				key = "(missing)"
-			}
-			counts[key]++
+			out = append(out, rec)
 		}
-		f.Close()
 	}
-	keys := make([]string, 0, len(counts))
-	for k := range counts {
-		keys = append(keys, k)
+	out, err = applyXQLFilter(out)
+	if err != nil {
+		fatal(err)
 	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		fmt.Printf("%s %d\n", k, counts[k])
+	if *flagGroupBy != "" || *flagHistogram != "" {
+		printRecordSummary(out)
+		return
+	}
+	printRecords(out)
+}
+
+func runSQLFileSearch(patterns, roots []string) {
+	pred, err := buildRecordPredicate()
+	if err != nil {
+		fatal(err)
+	}
+	mode := strings.ToLower(strings.TrimSpace(*flagSQLBlock))
+	if mode == "" {
+		mode = "statement"
+	}
+	var out []records.Record
+	for _, entry := range collectEntries(roots, runtime.GOMAXPROCS(0)*2) {
+		if !strings.EqualFold(filepath.Ext(entry.Path), ".sql") {
+			continue
+		}
+		blocks, err := records.ReadSQLBlocks(entry.Path, mode, *flagSQLContext)
+		if err != nil {
+			if !*flagNoMessages {
+				fmt.Fprintf(os.Stderr, "zrep: %v\n", err)
+			}
+			continue
+		}
+		for _, block := range blocks {
+			if *flagSQLKind != "" && !strings.EqualFold(block.Kind, *flagSQLKind) {
+				continue
+			}
+			rec := block.Record
+			if !recordMatchesPattern(rec, patterns) || !pred.Match(rec.Fields) {
+				continue
+			}
+			out = append(out, rec)
+		}
+	}
+	out, err = applyXQLFilter(out)
+	if err != nil {
+		fatal(err)
+	}
+	printRecords(out)
+}
+
+func buildRecordPredicate() (query.Predicate, error) {
+	var preds []query.Predicate
+	add := func(field, value string) {
+		if strings.TrimSpace(value) != "" {
+			preds = append(preds, query.FieldEquals(field, value))
+		}
+	}
+	add("activity", *flagActivity)
+	add("user_id", *flagUserID)
+	add("email", *flagEmail)
+	add("ip", *flagIP)
+	add("session_id", *flagSessionID)
+	add("request_id", *flagRequestID)
+	for _, field := range flagFields {
+		key, value, ok := strings.Cut(field, "=")
+		if !ok {
+			return nil, fmt.Errorf("--field requires KEY=VALUE, got %q", field)
+		}
+		add(key, value)
+	}
+	if strings.TrimSpace(*flagQuery) != "" {
+		pred, err := query.Parse(*flagQuery)
+		if err != nil {
+			return nil, err
+		}
+		preds = append(preds, pred)
+	}
+	return query.And(preds...), nil
+}
+
+func applyXQLFilter(recs []records.Record) ([]records.Record, error) {
+	expr := strings.TrimSpace(*flagXQL)
+	if expr == "" || len(recs) == 0 {
+		return recs, nil
+	}
+	queryText := xqlRecordQuery(expr)
+	xqlRows, maps := xqlRowsForRecords(recs)
+	cat := xql.NewInMemoryCatalog()
+	cat.RegisterWithRows("zrep_records", xql.InferSchemaFromRows("zrep_records", maps), xqlRows)
+	result, _, err := xql.RunResult(context.Background(), queryText, cat)
+	if err != nil {
+		return nil, fmt.Errorf("--xql: %w", err)
+	}
+	keep := map[int]bool{}
+	for _, row := range result.Rows {
+		idx, ok := xqlRowIndex(row["__zrep_index"])
+		if !ok {
+			return nil, fmt.Errorf("--xql query must preserve __zrep_index; use zrep_records | where ... or select __zrep_index")
+		}
+		if idx >= 0 && idx < len(recs) {
+			keep[idx] = true
+		}
+	}
+	out := make([]records.Record, 0, len(keep))
+	for i, rec := range recs {
+		if keep[i] {
+			out = append(out, rec)
+		}
+	}
+	return out, nil
+}
+
+func xqlRecordQuery(expr string) string {
+	lower := strings.ToLower(strings.TrimSpace(expr))
+	if strings.HasPrefix(lower, "where ") {
+		return "zrep_records | " + expr + " | select __zrep_index"
+	}
+	if strings.Contains(expr, "|") || strings.HasPrefix(lower, "zrep_records") || strings.HasPrefix(lower, "from ") {
+		return expr
+	}
+	return "zrep_records | where " + expr + " | select __zrep_index"
+}
+
+func xqlRowsForRecords(recs []records.Record) ([]xql.Row, []map[string]any) {
+	rows := make([]xql.Row, 0, len(recs))
+	maps := make([]map[string]any, 0, len(recs))
+	for i, rec := range recs {
+		row := xql.Row{
+			"__zrep_index": i,
+			"path":         rec.Path,
+			"line_start":   rec.LineStart,
+			"line_end":     rec.LineEnd,
+			"column":       rec.Column,
+			"text":         rec.Text,
+		}
+		for key, value := range rec.Fields {
+			row[key] = value
+		}
+		rows = append(rows, row)
+		m := make(map[string]any, len(row))
+		for key, value := range row {
+			m[key] = value
+		}
+		maps = append(maps, m)
+	}
+	return rows, maps
+}
+
+func xqlRowIndex(value any) (int, bool) {
+	switch v := value.(type) {
+	case int:
+		return v, true
+	case int64:
+		return int(v), true
+	case float64:
+		return int(v), true
+	case json.Number:
+		n, err := v.Int64()
+		return int(n), err == nil
+	case string:
+		n, err := strconv.Atoi(v)
+		return n, err == nil
+	default:
+		return 0, false
 	}
 }
 
-func logLineInRange(line string) bool {
-	ts, ok := parseLogTime(line)
+func recordMatchesPattern(rec records.Record, patterns []string) bool {
+	if len(patterns) == 0 {
+		return true
+	}
+	haystack := rec.Text
+	for key, value := range rec.Fields {
+		haystack += "\n" + key + "=" + value
+	}
+	if *flagIgnoreCase || *flagSmartCase && allLowerPatterns(patterns) {
+		haystack = strings.ToLower(haystack)
+	}
+	for _, pattern := range patterns {
+		p := pattern
+		if *flagIgnoreCase || *flagSmartCase && allLowerPatterns(patterns) {
+			p = strings.ToLower(p)
+		}
+		if strings.Contains(haystack, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func recordTimeInRange(value string) bool {
+	if value == "" {
+		return true
+	}
+	ts, ok := parseUserTime(value)
 	if !ok {
 		return true
 	}
@@ -1772,8 +1987,139 @@ func logLineInRange(line string) bool {
 	return true
 }
 
-func histogramBucket(line, unit string) string {
-	ts, ok := parseLogTime(line)
+func printRecordSummary(recs []records.Record) {
+	counts := map[string]int{}
+	for _, rec := range recs {
+		key := "matches"
+		if *flagHistogram != "" {
+			key = histogramBucket(rec.Fields["timestamp"], *flagHistogram)
+		} else if *flagGroupBy != "" {
+			key = rec.Fields[strings.ToLower(*flagGroupBy)]
+		}
+		if key == "" {
+			key = "(missing)"
+		}
+		counts[key]++
+	}
+	keys := make([]string, 0, len(counts))
+	for key := range counts {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		fmt.Printf("%s %d\n", key, counts[key])
+	}
+}
+
+func printRecords(recs []records.Record) {
+	switch strings.ToLower(*flagFormat) {
+	case "json":
+		for _, rec := range recs {
+			_ = json.NewEncoder(os.Stdout).Encode(recordOutput(rec))
+		}
+	case "pretty-json":
+		b, _ := json.MarshalIndent(recordOutputs(recs), "", "  ")
+		fmt.Println(string(b))
+	case "table":
+		printRecordTable(recs)
+	case "csv":
+		printRecordCSV(recs)
+	default:
+		for _, rec := range recs {
+			printRecordPlain(rec)
+		}
+	}
+}
+
+func recordOutputs(recs []records.Record) []map[string]any {
+	out := make([]map[string]any, 0, len(recs))
+	for _, rec := range recs {
+		out = append(out, recordOutput(rec))
+	}
+	return out
+}
+
+func recordOutput(rec records.Record) map[string]any {
+	row := map[string]any{
+		"path":       formatOutputPath(rec.Path),
+		"line_start": rec.LineStart,
+		"line_end":   rec.LineEnd,
+		"text":       rec.Text,
+	}
+	for k, v := range rec.Fields {
+		row[k] = v
+	}
+	return row
+}
+
+func printRecordPlain(rec records.Record) {
+	path := formatOutputPath(rec.Path)
+	if rec.LineEnd > rec.LineStart {
+		fmt.Printf("%s:%d-%d\n", path, rec.LineStart, rec.LineEnd)
+	} else {
+		fmt.Printf("%s:%d:%d\n", path, rec.LineStart, max(1, rec.Column))
+	}
+	for _, line := range strings.Split(rec.Text, "\n") {
+		fmt.Println("    " + line)
+	}
+}
+
+func printRecordTable(recs []records.Record) {
+	fields := selectedRecordFields(recs)
+	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, strings.Join(fields, "\t"))
+	for _, rec := range recs {
+		values := make([]string, len(fields))
+		row := recordOutput(rec)
+		for i, field := range fields {
+			values[i] = tableCell(fmt.Sprint(row[field]))
+		}
+		fmt.Fprintln(tw, strings.Join(values, "\t"))
+	}
+	tw.Flush()
+}
+
+func printRecordCSV(recs []records.Record) {
+	fields := selectedRecordFields(recs)
+	w := csv.NewWriter(os.Stdout)
+	_ = w.Write(fields)
+	for _, rec := range recs {
+		row := recordOutput(rec)
+		values := make([]string, len(fields))
+		for i, field := range fields {
+			values[i] = fmt.Sprint(row[field])
+		}
+		_ = w.Write(values)
+	}
+	w.Flush()
+}
+
+func selectedRecordFields(recs []records.Record) []string {
+	if selected := selectedInspectFields(); len(selected) > 0 {
+		return selected
+	}
+	fields := []string{"path", "line_start", "line_end", "timestamp", "level", "user_id", "email", "activity", "service", "ip", "request_id", "session_id", "kind", "table", "object", "text"}
+	seen := map[string]bool{}
+	var out []string
+	for _, field := range fields {
+		for _, rec := range recs {
+			if field == "path" || field == "line_start" || field == "line_end" || rec.Fields[field] != "" {
+				if !seen[field] {
+					seen[field] = true
+					out = append(out, field)
+				}
+				break
+			}
+		}
+	}
+	if len(out) == 0 {
+		return []string{"path", "line_start", "text"}
+	}
+	return out
+}
+
+func histogramBucket(value, unit string) string {
+	ts, ok := parseUserTime(value)
 	if !ok {
 		return "unknown"
 	}
@@ -1787,23 +2133,6 @@ func histogramBucket(line, unit string) string {
 	}
 }
 
-func parseLogTime(line string) (time.Time, bool) {
-	fields := strings.Fields(line)
-	if len(fields) == 0 {
-		return time.Time{}, false
-	}
-	candidates := []string{fields[0]}
-	if len(fields) > 1 {
-		candidates = append(candidates, fields[0]+" "+fields[1])
-	}
-	for _, c := range candidates {
-		if t, ok := parseUserTime(strings.Trim(c, "[]")); ok {
-			return t, true
-		}
-	}
-	return time.Time{}, false
-}
-
 func parseUserTime(value string) (time.Time, bool) {
 	for _, layout := range []string{time.RFC3339, "2006-01-02 15:04:05", "2006-01-02 15:04", "2006-01-02"} {
 		if t, err := time.ParseInLocation(layout, value, time.Local); err == nil {
@@ -1811,24 +2140,6 @@ func parseUserTime(value string) (time.Time, bool) {
 		}
 	}
 	return time.Time{}, false
-}
-
-func logField(line, field string) string {
-	for _, part := range strings.Fields(line) {
-		if k, v, ok := strings.Cut(part, "="); ok && k == field {
-			return strings.Trim(v, `"'`)
-		}
-	}
-	if strings.EqualFold(field, "severity") || strings.EqualFold(field, "level") {
-		for _, part := range strings.Fields(line) {
-			up := strings.ToUpper(strings.Trim(part, "[]:"))
-			switch up {
-			case "TRACE", "DEBUG", "INFO", "WARN", "WARNING", "ERROR", "FATAL":
-				return up
-			}
-		}
-	}
-	return ""
 }
 
 func contextLines() (int, int) {

@@ -140,6 +140,216 @@ zrep -F -stats 'customer_id' ~/Downloads/large-file.json
 zrep -JIRK ~/Downloads/large-file.json
 ```
 
+## Use Cases
+
+### Code Search In A Monorepo
+
+Find TODOs in source files while skipping generated and dependency folders:
+
+```sh
+zrep -F TODO . \
+  --glob '*.go' \
+  --glob '*.ts' \
+  --glob '!*.gen.go' \
+  --exclude-dir node_modules \
+  --exclude-dir vendor \
+  --sort path
+```
+
+Show context around a function or symbol:
+
+```sh
+zrep -C 3 'func Handle[A-Za-z]+' internal/
+```
+
+Use smart case for daily code search:
+
+```sh
+zrep -S todo .
+zrep -S TODO .
+```
+
+### Editor And CI Integration
+
+Emit editor-friendly `file:line:column:text` output:
+
+```sh
+zrep -F --vimgrep TODO .
+```
+
+Emit machine-readable JSON events for scripts:
+
+```sh
+zrep -F --json-events ERROR logs/
+```
+
+Fail fast in CI if a forbidden pattern exists:
+
+```sh
+zrep -F -q 'console.log' src/
+```
+
+### Large Files And Dumps
+
+Search a huge file without loading it all into memory:
+
+```sh
+zrep -F 'customer_id' ~/Downloads/large-file.json
+```
+
+Skip files that are too large for the current job:
+
+```sh
+zrep -F --max-filesize 500M ERROR dumps/
+```
+
+Search binary-ish dumps as text when you know that is intentional:
+
+```sh
+zrep -F --text NEEDLE dumps/
+```
+
+### Logs And Compressed Logs
+
+Search compressed logs:
+
+```sh
+zrep -F --search-compressed ERROR logs/app.log.gz
+zrep -F --search-compressed ERROR archives/
+```
+
+Group matching log lines by a `service=value` field:
+
+```sh
+zrep --logs --group-by service ERROR logs/
+```
+
+Build an hourly histogram of matching log lines:
+
+```sh
+zrep --logs --histogram hour ERROR logs/
+```
+
+Filter timestamped logs:
+
+```sh
+zrep --logs --since 2h ERROR logs/
+zrep --logs --from 2026-05-01 --to 2026-05-31 ERROR logs/
+```
+
+### Structured Data Exploration
+
+Inspect CSV, JSON, JSONL, or TSV without specifying a type:
+
+```sh
+zrep --inspect --sample 5 data/
+```
+
+Print a discovered schema:
+
+```sh
+zrep --schema data.json
+zrep --schema data.csv
+```
+
+Profile a CSV for nulls, unique values, and duplicates:
+
+```sh
+zrep --profile-data users.csv
+```
+
+Project and filter sampled structured data:
+
+```sh
+zrep --inspect --select id,user.login --flatten --where active=true --format table users.json
+```
+
+Use lightweight JSON and CSV query helpers:
+
+```sh
+zrep --jq '.login==ada' users.json
+zrep --sql 'SELECT id,login WHERE active=true' users.csv
+```
+
+### Advanced Pattern Matching
+
+Use pure-Go advanced regex compatibility mode for lookaround and backreferences:
+
+```sh
+zrep -P '(?<=user=)\d+' app.log
+zrep -P '(foo)(bar)\1' data.txt
+```
+
+Use fuzzy matching for misspellings in logs or text:
+
+```sh
+zrep --fuzzy --distance 2 authrization logs/
+```
+
+Use boolean term search:
+
+```sh
+zrep --boolean '(error OR fatal) AND timeout' logs/
+```
+
+### Config Profiles For Repeated Workflows
+
+Create and use a code-search profile:
+
+```sh
+zrep profile import code -- -F --sort path --glob '*.go' --glob '*.ts' --exclude-dir node_modules
+zrep --profile code TODO .
+```
+
+Create and use a large-JSON inspection profile:
+
+```sh
+zrep profile import large_json -- --inspect --format table --max-cell-width 80
+zrep --profile large_json ~/Downloads/large-file.json
+```
+
+Update or remove a profile:
+
+```sh
+zrep profile update code -- -F --sort path --glob '*.go'
+zrep profile remove code
+```
+
+### Replacement Preview And Safe Writes
+
+Preview replacements without editing files:
+
+```sh
+zrep -F --replace DONE TODO src/
+```
+
+Apply replacements to a specific file:
+
+```sh
+zrep -F --replace DONE --write TODO src/task.txt
+```
+
+### Path Discovery And Auditing
+
+List searchable files after filters:
+
+```sh
+zrep --files . --sort path
+zrep --files . --include '*.go' --exclude-dir vendor
+```
+
+Find files that do not contain a required marker:
+
+```sh
+zrep -F --files-without-match 'SPDX-License-Identifier' .
+```
+
+Follow symlinked source folders:
+
+```sh
+zrep -L TODO linked-src/
+```
+
 ## Supported Flags
 
 ```text
@@ -772,6 +982,39 @@ zrep --logs --histogram hour ERROR logs/
 ```text
 api 121
 worker 55
+```
+
+<!-- flag:activity --><!-- flag:user-id --><!-- flag:email --><!-- flag:ip --><!-- flag:session-id --><!-- flag:request-id --><!-- flag:field --><!-- flag:query --><!-- flag:xql -->
+### `--activity`, `--user-id`, `--email`, `--ip`, `--session-id`, `--request-id`, `--field`, `--query`, `--xql`
+Purpose: search log records by multiple extracted factors.
+```sh
+zrep --logs --user-id 42 --activity login logs/daily/
+zrep --logs --email ada@example.com --format table --select user_id,email,activity logs.jsonl
+zrep --logs --field service=api --query 'status = 500' ERROR logs/
+zrep --logs --xql 'user_id = 42 AND activity = "checkout"' logs/
+zrep --logs --xql 'zrep_records | where status == 500 | select __zrep_index' logs/
+```
+```text
+logs/app.log:12:1
+    2026-05-01T10:00:00Z INFO service=api user_id=42 activity=login
+```
+`--xql` runs through the local `github.com/oarkflow/xql` engine. A short expression is wrapped as `zrep_records | where ... | select __zrep_index`; full XQL pipelines can use the `zrep_records` source directly.
+
+<!-- flag:sql-files --><!-- flag:sql-block --><!-- flag:sql-context --><!-- flag:sql-kind -->
+### `--sql-files`, `--sql-block MODE`, `--sql-context N`, `--sql-kind KIND`
+Purpose: search `.sql` files and return full SQL blocks.
+```sh
+zrep --sql-files customer_id migrations/
+zrep --sql-files --sql-block statement user_id schema.sql
+zrep --sql-files --sql-block context --sql-context 2 customer_id schema.sql
+zrep --sql-files --sql-block object --sql-kind create users schema.sql
+```
+```text
+schema.sql:1-5
+    CREATE TABLE users (
+      id INTEGER,
+      user_id INTEGER
+    );
 ```
 
 <!-- flag:watch --><!-- flag:tui -->

@@ -140,6 +140,12 @@ func TestFlagExamples(t *testing.T) {
 		{name: "output", flags: []string{"output"}, args: []string{"--inspect", "--sample", "1", "--output", "json", fx.path("data.csv")}, wantStdoutHas: []string{`"kind":"csv"`}},
 		{name: "logs group", flags: []string{"logs", "group-by", "since", "from", "to"}, args: []string{"--logs", "--group-by", "service", "--since", "1000000h", "--from", "2026-01-01", "--to", "2026-12-31", "ERROR", fx.path("logs.txt")}, wantStdout: "api 1\nworker 1\n"},
 		{name: "logs histogram", flags: []string{"histogram"}, args: []string{"--logs", "--histogram", "hour", "ERROR", fx.path("logs.txt")}, wantStdoutHas: []string{"2026-05-01 10:00 2"}},
+		{name: "logs factors", flags: []string{"activity", "user-id", "email", "ip", "session-id", "request-id", "field", "query", "xql"}, args: []string{"--logs", "--user-id", "42", "--email", "ada@example.com", "--activity", "login", "--ip", "10.0.0.1", "--session-id", "s1", "--request-id", "r1", "--field", "service=api", "--query", "status = 200", "--xql", "activity = \"login\"", fx.path("activity.log")}, wantStdoutHas: []string{"login ok"}},
+		{name: "logs xql pipeline", flags: []string{}, args: []string{"--logs", "--xql", "zrep_records | where status == 200 | select __zrep_index", fx.path("activity.log")}, wantStdoutHas: []string{"login ok"}},
+		{name: "logs table select", flags: []string{}, args: []string{"--logs", "--email", "ada@example.com", "--format", "table", "--select", "user_id,email,activity", fx.path("activity.jsonl")}, wantStdoutHas: []string{"user_id  email            activity", "42       ada@example.com  checkout"}},
+		{name: "sql files statement", flags: []string{"sql-files", "sql-block"}, args: []string{"--sql-files", "--sql-block", "statement", "user_id", fx.path("schema.sql")}, wantStdoutHas: []string{"CREATE TABLE users", "user_id INTEGER"}},
+		{name: "sql files object", flags: []string{"sql-kind"}, args: []string{"--sql-files", "--sql-block", "object", "--sql-kind", "create", "users", fx.path("schema.sql")}, wantStdoutHas: []string{"<ROOT>/schema.sql:1-5", "CREATE TABLE users"}},
+		{name: "sql files context", flags: []string{"sql-context"}, args: []string{"--sql-files", "--sql-block", "context", "--sql-context", "1", "customer_id", fx.path("schema.sql")}, wantStdoutHas: []string{"INSERT INTO orders"}},
 		{name: "watch reserved", flags: []string{"watch"}, args: []string{"--watch", "TODO", fx.path("a.txt")}, wantExit: 2, wantStderrHas: []string{"--watch is reserved"}},
 		{name: "tui reserved", flags: []string{"tui"}, args: []string{"--tui", "TODO", fx.path("a.txt")}, wantExit: 2, wantStderrHas: []string{"--tui is reserved"}},
 		{name: "rows columns", flags: []string{"rows", "columns", "R", "K"}, args: []string{"-R", "-K", fx.path("data.csv")}, wantStdoutHas: []string{"rows: 3", "columns: id, login, note"}},
@@ -250,6 +256,9 @@ func newFlagFixture(t *testing.T) flagFixture {
 	write("data.jsonl", `{"id":1,"login":"ada","note":"TODO jsonl"}`+"\n")
 	write("advanced.txt", "user=42 action=login\nauthorization failed\nfatal timeout happened\n")
 	write("logs.txt", "2026-05-01T10:00:00Z ERROR service=api failed\n2026-05-01T10:30:00Z ERROR service=worker timeout\n2026-05-01T11:00:00Z INFO service=api ok\n")
+	write("activity.log", "2026-05-01T10:00:00Z INFO service=api user_id=42 email=ada@example.com activity=login ip=10.0.0.1 session_id=s1 request_id=r1 status=200 login ok\n")
+	write("activity.jsonl", `{"timestamp":"2026-05-01T10:00:00Z","service":"api","user_id":"42","email":"ada@example.com","activity":"checkout","status":200}`+"\n")
+	write("schema.sql", "CREATE TABLE users (\n  id INTEGER,\n  user_id INTEGER,\n  email TEXT\n);\n\nINSERT INTO orders (customer_id, user_id) VALUES (7, 42);\n")
 	write(".gitignore", "*.ignoreme\n")
 	write("custom.ignore", "a.txt\n")
 	write("real-link-dir/linked.txt", "LINKTODO through symlink\n")
