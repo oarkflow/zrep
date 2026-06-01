@@ -1,0 +1,10 @@
+{
+  "org": {
+    "id": "acme",
+    "users": [
+      {"id": 42, "email": "ada@example.com", "profile": {"name": "Ada", "role": "admin"}},
+      {"id": 7, "email": "grace@example.com", "profile": {"name": "Grace", "role": "operator"}}
+    ]
+  },
+  "note": "ZREP_NEEDLE nested"
+}

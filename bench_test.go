@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+
+	"github.com/zrep/zrep/internal/testdatafixture"
 )
 
 const benchPattern = "ZREP_NEEDLE"
@@ -213,6 +215,42 @@ func BenchmarkZrepVsRipgrep(b *testing.B) {
 			runBenchCommand(b, rg, op.rgArgs...)
 		})
 	}
+}
+
+func BenchmarkGeneratedTestdataModes(b *testing.B) {
+	fx := testdatafixture.Generated(b, testdatafixture.Options{Rows: 2048, Files: 8, Days: 5, MatchEvery: 37})
+	zrep := buildBenchBinary(b)
+	totalBytes := generatedFixtureBytes(b, fx)
+	ops := []struct {
+		name string
+		args []string
+	}{
+		{name: "large-json-grep", args: []string{"-F", "-c", "-no-color", testdatafixture.Marker, fx.Structured.UsersJSON}},
+		{name: "large-json-inspect", args: []string{"--inspect", "--sample", "5", "--format", "table", fx.Structured.UsersJSON}},
+		{name: "wide-csv-profile", args: []string{"--profile-data", fx.Structured.WideCSV}},
+		{name: "daily-log-factors", args: []string{"--logs", "--user-id", "42", "--activity", "login", fx.Logs.Root}},
+		{name: "sql-block-search", args: []string{"--sql-files", "--sql-block", "object", "--sql-kind", "create", "users", fx.SQL.Root}},
+		{name: "compressed-search", args: []string{"-F", "--search-compressed", "-c", "-no-color", testdatafixture.Marker, fx.Archives.Gzip}},
+	}
+	for _, op := range ops {
+		op := op
+		b.Run(op.name, func(b *testing.B) {
+			b.SetBytes(totalBytes)
+			runBenchCommand(b, zrep, op.args...)
+		})
+	}
+}
+
+func generatedFixtureBytes(tb testing.TB, fx testdatafixture.Fixture) int64 {
+	tb.Helper()
+	var total int64
+	for _, entry := range fx.Manifest {
+		total += entry.Bytes
+	}
+	if total == 0 {
+		tb.Fatalf("generated fixture manifest is empty")
+	}
+	return total
 }
 
 func buildBenchBinary(b *testing.B) string {

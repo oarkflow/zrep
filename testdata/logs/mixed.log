@@ -1,0 +1,3 @@
+INFO user_id=42 activity=login service=api
+plain text ERROR ada@example.com 10.0.0.1 ZREP_NEEDLE
+{"level":"ERROR","service":"worker","user_id":"7","activity":"job","status":500}

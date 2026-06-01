@@ -1,0 +1,5 @@
+[
+  {"id":1,"email":"ada@example.com","note":null},
+  {"id":2},
+  {"id":3,"email":"","note":"ZREP_NEEDLE missing fields"}
+]

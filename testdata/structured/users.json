@@ -1,0 +1,5 @@
+[
+  {"id":1,"user_id":"42","email":"ada@example.com","activity":"login","service":"api","status":200,"user":{"name":"Ada Lovelace"},"note":"ZREP_NEEDLE json"},
+  {"id":2,"user_id":"7","email":"grace@example.com","activity":"checkout","service":"billing","status":500,"user":{"name":"Grace Hopper"},"note":"payment failed"},
+  {"id":3,"user_id":"99","email":"linus@example.com","activity":"download","service":"worker","status":200,"user":{"name":"Linus Torvalds"},"note":"plain"}
+]

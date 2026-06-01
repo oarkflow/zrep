@@ -140,6 +140,122 @@ zrep -F -stats 'customer_id' ~/Downloads/large-file.json
 zrep -JIRK ~/Downloads/large-file.json
 ```
 
+## Testing Data Sets
+
+zrep ships a hybrid testdata system:
+
+- `testdata/` contains small, readable fixtures for examples, golden tests, and manual inspection.
+- `internal/testdatafixture` generates deterministic CI-safe fixtures for large JSON, CSV, daily logs, SQL files, archives, encodings, binary files, ignore files, and BCL config profiles.
+- `cmd/zrep-testdata` generates optional stress-scale data outside the repo for local benchmarking.
+
+Small fixture examples:
+
+```sh
+zrep --inspect --sample 5 testdata/structured/users.json
+zrep --logs --user-id 42 --activity login testdata/logs/
+zrep --sql-files --sql-block object --sql-kind create users testdata/sql/
+```
+
+Copy-paste commands for the checked-in `testdata/` tree:
+
+```sh
+# Structured JSON, JSONL, CSV, and TSV inspection.
+zrep --inspect --sample 5 testdata/structured/users.json
+zrep --inspect --sample 3 --format pretty-json testdata/structured/users.json
+zrep --inspect --select id,email,activity --format table testdata/structured/users.json
+zrep --inspect --select id,user.name --flatten --format table testdata/structured/users.json
+zrep --inspect --where email=ada@example.com --format table testdata/structured/users.json
+zrep --rows testdata/structured/users.json
+zrep --columns testdata/structured/users.json
+zrep --schema testdata/structured/users.json
+zrep --jq '.email==ada@example.com' testdata/structured/users.json
+
+zrep --inspect --sample 3 testdata/structured/users.jsonl
+zrep --inspect --sample 3 --format table testdata/structured/users.csv
+zrep --inspect --sample 3 --format csv testdata/structured/users.csv
+zrep --profile-data testdata/structured/users.csv
+zrep --schema testdata/structured/users.csv
+zrep --sql 'SELECT id,email WHERE activity=login' testdata/structured/users.csv
+zrep --inspect --sample 3 testdata/structured/users.tsv
+zrep --inspect --sample 2 --format table --max-cell-width 20 testdata/structured/wide.csv
+zrep --inspect --select org.users --flatten --format table testdata/structured/nested.json
+zrep --inspect --sample 3 testdata/structured/missing-null.json
+zrep -F ZREP_NEEDLE testdata/structured/malformed.jsonl
+
+# Plain search, path filters, hidden files, ignored files, and type filters.
+zrep -F ZREP_NEEDLE testdata/search/
+zrep -F -n ZREP_NEEDLE testdata/search/notes.txt
+zrep -F -C 1 ZREP_NEEDLE testdata/search/notes.txt
+zrep -F --count-matches ZREP_NEEDLE testdata/search/
+zrep --files testdata/search/ --sort path
+zrep --files testdata/search/ --hidden --sort path
+zrep -F --hidden ZREP_NEEDLE testdata/search/
+zrep -F --ignore-file testdata/config/zrep.ignore ZREP_NEEDLE testdata/search/
+zrep -F --no-ignore ZREP_NEEDLE testdata/search/ignored/skip.log
+zrep -F --glob '*.go' ZREP_NEEDLE testdata/search/
+zrep -F -t go ZREP_NEEDLE testdata/search/
+zrep -F -f testdata/config/patterns.txt testdata/search/
+
+# Record-aware daily logs and multi-factor activity searches.
+zrep --logs ERROR testdata/logs/
+zrep --logs --user-id 42 testdata/logs/
+zrep --logs --email ada@example.com testdata/logs/
+zrep --logs --activity login testdata/logs/
+zrep --logs --field service=api testdata/logs/
+zrep --logs --field status=500 ERROR testdata/logs/
+zrep --logs --from 2026-05-01 --to 2026-05-03 ERROR testdata/logs/
+zrep --logs --since 1000000h ERROR testdata/logs/
+zrep --logs --group-by service ERROR testdata/logs/
+zrep --logs --histogram hour ERROR testdata/logs/
+zrep --logs --query 'status = 500 AND service = "billing"' testdata/logs/
+zrep --logs --xql 'user_id = 42 AND activity = "login"' testdata/logs/
+zrep --logs --xql 'zrep_records | where status == 500 | select __zrep_index' testdata/logs/
+zrep --logs --format table --select timestamp,level,service,user_id,email,activity,status testdata/logs/activity.log
+zrep --logs --format json --email ada@example.com testdata/logs/2026-05-02/app.jsonl
+zrep --logs --ip 10.0.0.1 testdata/logs/mixed.log
+
+# SQL file search and block extraction.
+zrep --sql-files user_id testdata/sql/
+zrep --sql-files --sql-block statement user_id testdata/sql/migration.sql
+zrep --sql-files --sql-block context --sql-context 2 user_id testdata/sql/migration.sql
+zrep --sql-files --sql-block object --sql-kind create users testdata/sql/
+zrep --sql-files --sql-kind insert ZREP_NEEDLE testdata/sql/
+zrep --sql-files --format json user_id testdata/sql/
+zrep --sql-files --xql 'kind == "create" AND table == "users"' testdata/sql/
+
+# Config profiles and pattern/config examples.
+zrep --config testdata/config/zrep.bcl ZREP_NEEDLE testdata/search/
+zrep --config testdata/config/zrep.bcl --profile code ZREP_NEEDLE testdata/search/
+zrep --config testdata/config/zrep.bcl --config-id logs ERROR testdata/logs/
+ZREP_CONFIG_PATH=testdata/config/zrep.bcl ZREP_PROFILE=code zrep ZREP_NEEDLE testdata/search/
+
+# Generated binary, UTF-16, gzip, zip, and larger stress fixtures.
+go run ./cmd/zrep-testdata -root /tmp/zrep-testdata -rows 10000 -days 14
+zrep -F --text ZREP_NEEDLE /tmp/zrep-testdata/search/binary.bin
+zrep -F --encoding utf-16le ZREP_NEEDLE /tmp/zrep-testdata/search/utf16.txt
+zrep -F --search-compressed ERROR /tmp/zrep-testdata/archives/app.log.gz
+zrep -F --search-archives ZREP_NEEDLE /tmp/zrep-testdata/archives/bundle.zip
+zrep --inspect --sample 5 /tmp/zrep-testdata/structured/users.json
+zrep --logs --user-id 42 --activity login /tmp/zrep-testdata/logs/
+```
+
+Generate a larger local corpus:
+
+```sh
+go run ./cmd/zrep-testdata -root /tmp/zrep-testdata -rows 10000 -days 14
+zrep -F --search-compressed ERROR /tmp/zrep-testdata/archives/app.log.gz
+```
+
+Generate stress fixtures through tests:
+
+```sh
+go test ./internal/testdatafixture -run TestGenerateStressCorpus -stress-root /tmp/zrep-testdata
+ZREP_STRESS_TESTDATA=1 ZREP_STRESS_ROWS=100000 go test ./internal/testdatafixture -run TestGenerateStressCorpus
+```
+
+The stress generator prints a manifest with each file path, type, row count,
+byte size, and example zrep commands.
+
 ## Use Cases
 
 ### Code Search In A Monorepo

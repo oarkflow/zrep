@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/zrep/zrep/internal/testdatafixture"
 )
 
 func TestMatchGlobPlatformAgnostic(t *testing.T) {
@@ -329,6 +331,45 @@ func TestZrepFeatureSmoke(t *testing.T) {
 	out = runZrep(t, "-inspect", "--select", "id,user.name", "--flatten", "--where", "login=b", "--format", "table", "--limit", "2", filepath.Join(dir, "data.json"))
 	if !strings.Contains(out, "user.name") || !strings.Contains(out, "Bob") || strings.Contains(out, "Ada") {
 		t.Fatalf("inspect select/where/flatten output wrong:\n%s", out)
+	}
+}
+
+func TestGeneratedTestdataWorkflows(t *testing.T) {
+	fx := testdatafixture.Generated(t, testdatafixture.Options{Rows: 48, Files: 2, Days: 2, MatchEvery: 6})
+
+	out := runZrep(t, "--inspect", "--select", "id,email", "--format", "table", "--limit", "2", fx.Structured.UsersJSON)
+	if !strings.Contains(out, "ada@example.com") || !strings.Contains(out, "email") {
+		t.Fatalf("large JSON inspect workflow output wrong:\n%s", out)
+	}
+
+	out = runZrep(t, "--profile-data", fx.Structured.UsersCSV)
+	if !strings.Contains(out, "rows: 48") || !strings.Contains(out, "email nulls=0") {
+		t.Fatalf("large CSV profile workflow output wrong:\n%s", out)
+	}
+
+	out = runZrep(t, "--logs", "--user-id", "42", "--activity", "login", "--from", "2026-05-01", "--to", "2026-05-03", fx.Logs.Root)
+	if !strings.Contains(out, "user_id=42") || !strings.Contains(out, "activity=login") {
+		t.Fatalf("daily log factor workflow output wrong:\n%s", out)
+	}
+
+	out = runZrep(t, "--logs", "--xql", `zrep_records | where status == 500 | select __zrep_index`, fx.Logs.Activity)
+	if !strings.Contains(out, "payment failed") {
+		t.Fatalf("xql log workflow output wrong:\n%s", out)
+	}
+
+	out = runZrep(t, "--sql-files", "--sql-block", "object", "--sql-kind", "create", "users", fx.SQL.Root)
+	if !strings.Contains(out, "CREATE TABLE users") {
+		t.Fatalf("SQL block workflow output wrong:\n%s", out)
+	}
+
+	out = runZrep(t, "-F", "--search-compressed", "ZREP_NEEDLE", fx.Archives.Gzip)
+	if !strings.Contains(out, "gzip") {
+		t.Fatalf("compressed workflow output wrong:\n%s", out)
+	}
+
+	out = runZrep(t, "-F", "--text", "ZREP_NEEDLE", fx.Search.Binary)
+	if !strings.Contains(out, "binary") {
+		t.Fatalf("binary-as-text workflow output wrong:\n%s", out)
 	}
 }
 

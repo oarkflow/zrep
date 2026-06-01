@@ -1,0 +1,4 @@
+id	user_id	email	activity	service	status	note
+1	42	ada@example.com	login	api	200	ZREP_NEEDLE tsv
+2	7	grace@example.com	checkout	billing	500	failed
+3	99	linus@example.com	download	worker	200	plain

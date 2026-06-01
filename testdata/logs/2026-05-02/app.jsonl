@@ -1,0 +1,2 @@
+{"timestamp":"2026-05-02T10:00:00Z","level":"INFO","service":"api","user_id":"42","email":"ada@example.com","activity":"login","ip":"10.0.1.1","request_id":"req-101","session_id":"sess-42","status":200,"message":"ZREP_NEEDLE login ok"}
+{"timestamp":"2026-05-02T10:05:00Z","level":"ERROR","service":"billing","user_id":"7","email":"grace@example.com","activity":"checkout","ip":"10.0.1.2","request_id":"req-102","session_id":"sess-7","status":500,"message":"payment failed"}

@@ -1,0 +1,6 @@
+global ["-F", "--sort", "path"]
+profiles {
+  logs ["--logs", "--field", "service=api"]
+  large_json ["--inspect", "--format", "table", "--max-cell-width", "80"]
+  code ["--glob", "*.go", "--exclude-dir", "vendor"]
+}
