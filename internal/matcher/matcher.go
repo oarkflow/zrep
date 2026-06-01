@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"regexp"
 	"regexp/syntax"
+	"strings"
 	"unicode/utf8"
 	"unsafe"
 )
@@ -339,9 +340,11 @@ func NewRegex(pattern string, ignoreCase bool) (Matcher, error) {
 
 	// Check if it's a pure literal (no metacharacters)
 	parsed, _ := syntax.Parse(pattern, syntax.Perl)
-	if parsed != nil && isLiteral(parsed) {
-		lit := NewLiteral(pattern, ignoreCase)
-		return &regexMatcher{re: re, literal: pattern, prefix: prefix, lit: lit}, nil
+	if parsed != nil {
+		if literal, ok := literalString(parsed); ok {
+			lit := NewLiteral(literal, ignoreCase)
+			return &regexMatcher{re: re, literal: literal, prefix: prefix, lit: lit}, nil
+		}
 	}
 
 	return &regexMatcher{re: re, prefix: prefix}, nil
@@ -365,6 +368,29 @@ func isLiteral(re *syntax.Regexp) bool {
 		return len(re.Sub) == 1 && isLiteral(re.Sub[0])
 	}
 	return false
+}
+
+func literalString(re *syntax.Regexp) (string, bool) {
+	switch re.Op {
+	case syntax.OpLiteral:
+		return string(re.Rune), true
+	case syntax.OpCapture:
+		if len(re.Sub) != 1 {
+			return "", false
+		}
+		return literalString(re.Sub[0])
+	case syntax.OpConcat:
+		var b strings.Builder
+		for _, sub := range re.Sub {
+			s, ok := literalString(sub)
+			if !ok {
+				return "", false
+			}
+			b.WriteString(s)
+		}
+		return b.String(), true
+	}
+	return "", false
 }
 
 func (m *regexMatcher) Match(b []byte) (int, int) {
@@ -398,6 +424,7 @@ type LineMatch struct {
 	LineNum int
 	Line    []byte  // slice into original buffer — zero copy
 	Matches []Match // byte offsets within Line
+	Context bool    // true when the line is included as surrounding context
 }
 
 // FindMatchingLines finds all lines in buf that contain a match.

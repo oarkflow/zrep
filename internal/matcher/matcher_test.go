@@ -116,6 +116,18 @@ func TestCaseInsensitive(t *testing.T) {
 	}
 }
 
+func TestRegexWrappedLiteralIgnoreCase(t *testing.T) {
+	m, err := matcher.NewRegex("(?:todo)", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := []byte("TODO todo")
+	matches := m.MatchAll(b, nil)
+	if len(matches) != 2 {
+		t.Fatalf("expected 2 matches, got %d: %v", len(matches), matches)
+	}
+}
+
 func TestNoMatch(t *testing.T) {
 	m := matcher.NewLiteral("xyz", false)
 	b := []byte("hello world")

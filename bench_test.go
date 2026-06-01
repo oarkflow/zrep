@@ -13,8 +13,9 @@ import (
 const benchPattern = "ZREP_NEEDLE"
 
 type benchCorpus struct {
-	dir   string
-	bytes int64
+	dir         string
+	patternFile string
+	bytes       int64
 }
 
 // BenchmarkZrepVsRipgrep runs an end-to-end CLI benchmark against ripgrep.
@@ -116,6 +117,56 @@ func BenchmarkZrepVsRipgrep(b *testing.B) {
 			name:     "binary-as-text-count",
 			zrepArgs: []string{"-F", "-c", "-no-color", "-text", benchPattern, corpus.dir},
 			rgArgs:   []string{"--fixed-strings", "--count", "--color=never", "--no-messages", "--no-ignore", "--text", benchPattern, corpus.dir},
+		},
+		{
+			name:     "files",
+			zrepArgs: []string{"--files", "-no-color", corpus.dir},
+			rgArgs:   []string{"--files", "--color=never", "--no-messages", "--no-ignore", corpus.dir},
+		},
+		{
+			name:     "pattern-file-count",
+			zrepArgs: []string{"-F", "-c", "-no-color", "-f", corpus.patternFile, corpus.dir},
+			rgArgs:   []string{"--fixed-strings", "--count", "--color=never", "--no-messages", "--no-ignore", "-f", corpus.patternFile, corpus.dir},
+		},
+		{
+			name:     "files-without-match",
+			zrepArgs: []string{"-F", "--files-without-match", "-no-color", "NO_SUCH_ZREP_NEEDLE", corpus.dir},
+			rgArgs:   []string{"--fixed-strings", "--files-without-match", "--color=never", "--no-messages", "--no-ignore", "NO_SUCH_ZREP_NEEDLE", corpus.dir},
+		},
+		{
+			name:     "count-matches",
+			zrepArgs: []string{"-F", "--count-matches", "-no-color", benchPattern, corpus.dir},
+			rgArgs:   []string{"--fixed-strings", "--count-matches", "--color=never", "--no-messages", "--no-ignore", benchPattern, corpus.dir},
+		},
+		{
+			name:     "max-count",
+			zrepArgs: []string{"-F", "--max-count", "1", "-no-color", benchPattern, corpus.dir},
+			rgArgs:   []string{"--fixed-strings", "--max-count", "1", "--color=never", "--no-messages", "--no-ignore", benchPattern, corpus.dir},
+		},
+		{
+			name:     "max-columns-preview",
+			zrepArgs: []string{"-F", "--max-columns", "48", "--max-columns-preview", "-no-color", benchPattern, corpus.dir},
+			rgArgs:   []string{"--fixed-strings", "--max-columns", "48", "--max-columns-preview", "--color=never", "--no-messages", "--no-ignore", benchPattern, corpus.dir},
+		},
+		{
+			name:     "passthru",
+			zrepArgs: []string{"-F", "--passthru", "-no-color", benchPattern, corpus.dir},
+			rgArgs:   []string{"--fixed-strings", "--passthru", "--color=never", "--no-messages", "--no-ignore", benchPattern, corpus.dir},
+		},
+		{
+			name:     "glob-alias-count",
+			zrepArgs: []string{"-F", "-c", "-no-color", "--glob", "*.log", benchPattern, corpus.dir},
+			rgArgs:   []string{"--fixed-strings", "--count", "--color=never", "--no-messages", "--no-ignore", "--glob", "*.log", benchPattern, corpus.dir},
+		},
+		{
+			name:     "sort-path-count",
+			zrepArgs: []string{"-F", "-c", "-no-color", "--sort", "path", benchPattern, corpus.dir},
+			rgArgs:   []string{"--fixed-strings", "--count", "--color=never", "--no-messages", "--no-ignore", "--sort", "path", benchPattern, corpus.dir},
+		},
+		{
+			name:     "json-events",
+			zrepArgs: []string{"-F", "--json-events", "-no-color", benchPattern, corpus.dir},
+			rgArgs:   []string{"--fixed-strings", "--json", "--color=never", "--no-messages", "--no-ignore", benchPattern, corpus.dir},
 		},
 	}
 
@@ -223,5 +274,10 @@ func createBenchCorpus(tb testing.TB) benchCorpus {
 	}
 	total += int64(len(binaryData))
 
-	return benchCorpus{dir: dir, bytes: total}
+	patternFile := filepath.Join(dir, "patterns.txt")
+	if err := os.WriteFile(patternFile, []byte(benchPattern+"\ntheta\n"), 0o644); err != nil {
+		tb.Fatalf("write benchmark pattern file: %v", err)
+	}
+
+	return benchCorpus{dir: dir, patternFile: patternFile, bytes: total}
 }
