@@ -60,8 +60,9 @@ zrep -F --json-events TODO .
 zrep -F --glob '*.go' TODO .
 zrep -F --glob '!*.gen.go' TODO .
 zrep -F --sort path TODO .
-zrep --config ~/.config/zrep/work.conf TODO .
-ZREP_CONFIG_PATH=~/.config/zrep/work.conf zrep TODO .
+zrep --profile code TODO .
+zrep --config ~/.config/zrep/config.bcl TODO .
+ZREP_CONFIG_PATH=~/.config/zrep/config.bcl zrep TODO .
 zrep -F -include '*.go' TODO .
 zrep -F -include-dir internal -exclude-dir vendor TODO .
 zrep -F -hidden -text NEEDLE dumps
@@ -189,6 +190,8 @@ zrep -JIRK ~/Downloads/large-file.json
 -debug
 -version
 -config FILE read flags from a config file
+-profile ID  apply a named BCL config profile
+-config-id ID alias for -profile
 -no-config  do not read config files
 -text       search binary files as text
 -hidden     search hidden files and directories
@@ -223,7 +226,8 @@ Uppercase short aliases are used for newer modes to avoid collisions:
 ```text
 -J  alias for -json
 -G  alias for -vimgrep
--P  alias for -pretty
+-P  alias for -pcre2
+-L  alias for -follow
 -I  alias for -inspect
 -R  alias for -rows
 -K  alias for -columns
@@ -235,7 +239,6 @@ Uppercase short aliases are used for newer modes to avoid collisions:
 -r TEXT  alias for -replace TEXT
 -E NAME  alias for -encoding NAME
 -N NUM   alias for -sample NUM
--L NUM   alias for -limit NUM
 ```
 
 Long zrep-friendly aliases include `--list-files`, `--without-match`,
@@ -556,11 +559,11 @@ zrep -F --heading TODO <ROOT>/a.txt
     alpha TODO one
 ```
 
-<!-- flag:pretty --><!-- flag:P -->
-### `--pretty`, `-P`
+<!-- flag:pretty -->
+### `--pretty`
 Purpose: force pretty block output.
 ```sh
-zrep -F -P "TODO one" <ROOT>/a.txt
+zrep -F --pretty "TODO one" <ROOT>/a.txt
 ```
 ```text
 1:7-14
@@ -709,14 +712,77 @@ zrep --version
 zrep dev
 ```
 
-<!-- flag:config --><!-- flag:no-config --><!-- flag:ZREP_CONFIG_PATH --><!-- flag:ZREP_NO_CONFIG -->
-### `--config FILE`, `--no-config`, `ZREP_CONFIG_PATH`, `ZREP_NO_CONFIG`
-Purpose: opt into or disable config loading.
+<!-- flag:config --><!-- flag:profile --><!-- flag:config-id --><!-- flag:no-config --><!-- flag:ZREP_CONFIG_PATH --><!-- flag:ZREP_PROFILE --><!-- flag:ZREP_NO_CONFIG -->
+### `--config FILE`, `--profile ID`, `--config-id ID`, `--no-config`, `ZREP_CONFIG_PATH`, `ZREP_PROFILE`, `ZREP_NO_CONFIG`
+Purpose: load config flags, apply named BCL profiles, or disable config loading.
 ```sh
-ZREP_CONFIG_PATH=<ROOT>/zrep.conf zrep TODO <ROOT>
+zrep --profile code TODO <ROOT>
 ```
 ```text
-<ROOT>/a.txt:3
+<ROOT>/sub/c.log:1:1-4
+    TODO in log
+```
+
+<!-- flag:pcre2 --><!-- flag:P --><!-- flag:fuzzy --><!-- flag:distance --><!-- flag:boolean --><!-- flag:semantic -->
+### `-P`, `--pcre2`, `--fuzzy`, `--distance N`, `--boolean`, `--semantic`
+Purpose: opt into advanced pure-Go match engines.
+```sh
+zrep -P '(?<=user=)\d+' <ROOT>/advanced.txt
+zrep --fuzzy --distance 2 authrization <ROOT>/advanced.txt
+zrep --boolean '(error OR fatal) AND timeout' <ROOT>/advanced.txt
+```
+```text
+1:6-8
+    user=42 action=login
+```
+
+<!-- flag:follow --><!-- flag:L --><!-- flag:max-filesize --><!-- flag:ignore-file --><!-- flag:search-compressed -->
+### `-L`, `--follow`, `--max-filesize SIZE`, `--ignore-file FILE`, `--search-compressed`
+Purpose: control path discovery, symlink traversal, large-file skipping, extra ignore files, and compressed input.
+```sh
+zrep -L TODO linked-dir
+zrep --max-filesize 100M TODO .
+zrep --ignore-file custom.ignore TODO .
+zrep --search-compressed ERROR logs.gz
+```
+```text
+matching lines from followed, allowed, and compressed inputs
+```
+
+<!-- flag:schema --><!-- flag:profile-data --><!-- flag:jq --><!-- flag:sql --><!-- flag:output -->
+### `--schema`, `--profile-data`, `--jq EXPR`, `--sql QUERY`, `--output FORMAT`
+Purpose: inspect, filter, and transform structured local data.
+```sh
+zrep --schema <ROOT>/data.json
+zrep --profile-data <ROOT>/data.csv
+zrep --jq '.login==ada' <ROOT>/data.json
+zrep --sql 'SELECT id,login WHERE login=bob' <ROOT>/data.csv
+```
+```text
+schema, profile rows, or filtered records
+```
+
+<!-- flag:logs --><!-- flag:since --><!-- flag:from --><!-- flag:to --><!-- flag:group-by --><!-- flag:histogram -->
+### `--logs`, `--since DURATION`, `--from TIME`, `--to TIME`, `--group-by FIELD`, `--histogram UNIT`
+Purpose: summarize timestamped log matches.
+```sh
+zrep --logs --group-by service ERROR logs/
+zrep --logs --histogram hour ERROR logs/
+```
+```text
+api 121
+worker 55
+```
+
+<!-- flag:watch --><!-- flag:tui -->
+### `--watch`, `--tui`
+Purpose: reserved pure-Go live and interactive modes.
+```sh
+zrep --watch TODO logs/
+zrep --tui TODO .
+```
+```text
+zrep reports that the mode is reserved until the interactive implementation is enabled.
 ```
 
 <!-- flag:text -->
@@ -804,7 +870,7 @@ zrep -F -c TODO <ROOT> --sort path
 <ROOT>/data.json:1
 ```
 
-<!-- flag:inspect --><!-- flag:rows --><!-- flag:columns --><!-- flag:sample --><!-- flag:limit --><!-- flag:format --><!-- flag:max-cell-width --><!-- flag:cell-width --><!-- flag:select --><!-- flag:flatten --><!-- flag:where --><!-- flag:I --><!-- flag:R --><!-- flag:K --><!-- flag:N --><!-- flag:L -->
+<!-- flag:inspect --><!-- flag:rows --><!-- flag:columns --><!-- flag:sample --><!-- flag:limit --><!-- flag:format --><!-- flag:max-cell-width --><!-- flag:cell-width --><!-- flag:select --><!-- flag:flatten --><!-- flag:where --><!-- flag:I --><!-- flag:R --><!-- flag:K --><!-- flag:N -->
 ### Inspect flags
 Purpose: inspect structured files, sample records, project fields, and format output.
 ```sh
@@ -867,38 +933,120 @@ fields are top-level by default; use `--flatten` for nested dot paths such as
 ## Config Files
 
 zrep can read flags from a config file so you do not need to remember the same
-options for every search. Config loading is opt-in by default, so plain `zrep`
-commands stay predictable in scripts and benchmarks.
+options for every search. Config loading is still off for plain `zrep` commands,
+so scripts and benchmarks stay predictable.
 
 Config can be enabled with:
 
 ```text
 $ZREP_CONFIG_PATH
 --config FILE
+--profile ID
+--config-id ID
+ZREP_PROFILE=ID
+```
+
+When a profile is selected without `--config` or `ZREP_CONFIG_PATH`, zrep reads
+the first existing default BCL config from:
+
+```text
+$XDG_CONFIG_HOME/zrep/config.bcl
+~/.config/zrep/config.bcl
+~/.zrep.bcl
 ```
 
 Use `--no-config` or `ZREP_NO_CONFIG=1` to force-disable config loading even
-when `--config` or `ZREP_CONFIG_PATH` is present.
+when `--config`, `ZREP_CONFIG_PATH`, or a profile selector is present.
 
-Config files use shell-like whitespace splitting, quotes, backslash escaping,
-and `#` comments at the start of a token. Put one flag or command fragment per
-line for readability:
+`.bcl` is the recommended config format. It supports global flags plus named
+profiles that can be selected with `--profile ID`, `--config-id ID`, or
+`ZREP_PROFILE=ID`.
 
-```text
-# ~/.config/zrep/work.conf
--F
--S
---hidden
---glob '!node_modules'
---glob '!dist'
---max-columns 240
---max-columns-preview
---sort path
+```bcl
+global ["-F", "--sort", "path", "--max-columns", "240", "--max-columns-preview"]
+
+profiles {
+  code ["--glob", "*.go", "--glob", "*.ts", "--exclude-dir", "node_modules"]
+  large_json ["--inspect", "--format", "table", "--max-cell-width", "80"]
+  logs ["-F", "--passthru", "--max-count", "20"]
+}
 ```
 
 CLI arguments are appended after config arguments, so command-line values for
 scalar flags such as `--sort`, `--format`, or `--max-columns` override earlier
 config values.
+
+Application order:
+
+```text
+global config flags
+selected profile flags
+CLI flags
+```
+
+Examples:
+
+```sh
+# Use the default BCL config profile.
+zrep --profile code TODO .
+
+# Global BCL config only from an explicit file.
+zrep --config ~/.config/zrep/config.bcl TODO .
+
+# Equivalent profile selector.
+zrep --config-id large_json ~/Downloads/large-file.json
+
+# Select profile through the environment.
+ZREP_PROFILE=logs zrep ERROR logs/
+
+# Select profile from an explicit config path.
+ZREP_CONFIG_PATH=~/.config/zrep/team.bcl ZREP_PROFILE=logs zrep ERROR logs/
+```
+
+Manage profiles with the `profile` subcommand. Use `--config FILE` to edit a
+specific BCL file, or omit it to edit the default BCL config path.
+
+```sh
+# Add a new profile. `--` keeps the profile flags from being parsed as zrep command flags.
+zrep profile import code -- -F --glob '*.go' --exclude-dir node_modules
+
+# Replace an existing profile.
+zrep profile update code -- -F --glob '*.go' --glob '*.ts'
+
+# Show profile IDs.
+zrep profile list
+
+# Remove a profile.
+zrep profile remove code
+```
+
+Responses:
+
+```text
+imported profile "code" into ~/.config/zrep/config.bcl
+updated profile "code" in ~/.config/zrep/config.bcl
+code
+removed profile "code" from ~/.config/zrep/config.bcl
+```
+
+If a selected profile does not exist, zrep exits with code `2`:
+
+```text
+zrep: config profile "missing" not found in ~/.config/zrep/config.bcl
+```
+
+If a profile is selected but no default BCL config exists, zrep exits with code
+`2` and asks for a default config or `--config`:
+
+```text
+zrep: config profile "code" requested but no default config was found; create ...
+```
+
+Non-BCL config files still use the legacy shell-like whitespace splitting,
+quotes, backslash escaping, and `#` comments at the start of a token. Profile
+selection is ignored for legacy flat config files. Prefer `.bcl` for new
+configuration; legacy flat files can use any non-`.bcl` extension such as
+`.flags` or `.txt`.
 
 ## Benchmarks
 
@@ -938,13 +1086,17 @@ passthru
 glob alias count
 sort path count
 json-events
+max-filesize count
+advanced regex
+compressed gzip
+fuzzy count
+schema csv
 ```
 
 ## Notes
 
-`zrep` is not full ripgrep parity yet. PCRE2 is intentionally not implemented
-in this pass because the Go standard library regexp engine does not support
-look-around or backreferences without adding cross-platform dependency
-complexity.
+`zrep` uses a pure-Go advanced regex engine for `-P/--pcre2`. It supports many
+PCRE-style constructs such as lookaround and backreferences, but it is not the
+native PCRE2 C library.
 
 This project is currently optimizing the core search pipeline first.

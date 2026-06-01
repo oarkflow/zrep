@@ -10,6 +10,8 @@ import (
 	"strings"
 	"unicode/utf8"
 	"unsafe"
+
+	"github.com/dlclark/regexp2"
 )
 
 // Matcher is the interface all matchers implement.
@@ -18,6 +20,257 @@ type Matcher interface {
 	Match(b []byte) (int, int)
 	// MatchAll appends all non-overlapping [start,end) match ranges into dst.
 	MatchAll(b []byte, dst []Match) []Match
+}
+
+type fuzzyMatcher struct {
+	needle   string
+	distance int
+}
+
+type booleanMatcher struct {
+	expr boolExpr
+}
+
+type boolExpr interface {
+	eval(string) bool
+	term() string
+}
+
+type termExpr string
+
+func (e termExpr) eval(s string) bool { return strings.Contains(s, string(e)) }
+func (e termExpr) term() string       { return string(e) }
+
+type notExpr struct{ child boolExpr }
+
+func (e notExpr) eval(s string) bool { return !e.child.eval(s) }
+func (e notExpr) term() string       { return e.child.term() }
+
+type binaryExpr struct {
+	op          string
+	left, right boolExpr
+}
+
+func (e binaryExpr) eval(s string) bool {
+	if e.op == "AND" {
+		return e.left.eval(s) && e.right.eval(s)
+	}
+	return e.left.eval(s) || e.right.eval(s)
+}
+func (e binaryExpr) term() string { return e.left.term() }
+
+// NewBoolean creates a simple boolean term matcher supporting AND, OR, NOT,
+// parentheses, and quoted terms.
+func NewBoolean(pattern string, ignoreCase bool) (Matcher, error) {
+	tokens := booleanTokens(pattern)
+	p := boolParser{tokens: tokens}
+	expr := p.parseOr()
+	if expr == nil {
+		expr = termExpr(pattern)
+	}
+	if ignoreCase {
+		expr = lowerBoolExpr(expr)
+	}
+	return &booleanMatcher{expr: expr}, nil
+}
+
+func (m *booleanMatcher) Match(b []byte) (int, int) {
+	s := strings.ToLower(string(b))
+	if !m.expr.eval(s) {
+		return -1, -1
+	}
+	term := m.expr.term()
+	if term == "" {
+		return 0, 0
+	}
+	start := strings.Index(s, term)
+	if start < 0 {
+		return 0, len(b)
+	}
+	return start, start + len(term)
+}
+
+func (m *booleanMatcher) MatchAll(b []byte, dst []Match) []Match {
+	start, end := m.Match(b)
+	if start >= 0 {
+		dst = append(dst, Match{Start: start, End: end})
+	}
+	return dst
+}
+
+type boolParser struct {
+	tokens []string
+	pos    int
+}
+
+func (p *boolParser) parseOr() boolExpr {
+	left := p.parseAnd()
+	for p.peek("OR") {
+		p.pos++
+		left = binaryExpr{op: "OR", left: left, right: p.parseAnd()}
+	}
+	return left
+}
+
+func (p *boolParser) parseAnd() boolExpr {
+	left := p.parseUnary()
+	for p.peek("AND") {
+		p.pos++
+		left = binaryExpr{op: "AND", left: left, right: p.parseUnary()}
+	}
+	return left
+}
+
+func (p *boolParser) parseUnary() boolExpr {
+	if p.peek("NOT") {
+		p.pos++
+		return notExpr{child: p.parseUnary()}
+	}
+	if p.peek("(") {
+		p.pos++
+		expr := p.parseOr()
+		if p.peek(")") {
+			p.pos++
+		}
+		return expr
+	}
+	if p.pos >= len(p.tokens) {
+		return termExpr("")
+	}
+	tok := strings.ToLower(p.tokens[p.pos])
+	p.pos++
+	return termExpr(tok)
+}
+
+func (p *boolParser) peek(tok string) bool {
+	return p.pos < len(p.tokens) && strings.EqualFold(p.tokens[p.pos], tok)
+}
+
+func booleanTokens(s string) []string {
+	var out []string
+	var b strings.Builder
+	quoted := false
+	flush := func() {
+		if b.Len() > 0 {
+			out = append(out, b.String())
+			b.Reset()
+		}
+	}
+	for _, r := range s {
+		switch {
+		case r == '"':
+			if quoted {
+				flush()
+			}
+			quoted = !quoted
+		case quoted:
+			b.WriteRune(r)
+		case r == '(' || r == ')':
+			flush()
+			out = append(out, string(r))
+		case r == ' ' || r == '\t' || r == '\n':
+			flush()
+		default:
+			b.WriteRune(r)
+		}
+	}
+	flush()
+	return out
+}
+
+func lowerBoolExpr(expr boolExpr) boolExpr {
+	switch e := expr.(type) {
+	case termExpr:
+		return termExpr(strings.ToLower(string(e)))
+	case notExpr:
+		return notExpr{child: lowerBoolExpr(e.child)}
+	case binaryExpr:
+		return binaryExpr{op: e.op, left: lowerBoolExpr(e.left), right: lowerBoolExpr(e.right)}
+	default:
+		return expr
+	}
+}
+
+// NewFuzzy creates a bounded edit-distance matcher for whole tokens and lines.
+func NewFuzzy(pattern string, distance int) Matcher {
+	if distance <= 0 {
+		distance = 2
+	}
+	return &fuzzyMatcher{needle: strings.ToLower(pattern), distance: distance}
+}
+
+func (m *fuzzyMatcher) Match(b []byte) (int, int) {
+	text := strings.ToLower(string(b))
+	bestStart, bestEnd := -1, -1
+	for start := 0; start < len(text); {
+		for start < len(text) && !isWordByte(text[start]) {
+			start++
+		}
+		end := start
+		for end < len(text) && isWordByte(text[end]) {
+			end++
+		}
+		if end > start && editDistanceAtMost(text[start:end], m.needle, m.distance) {
+			bestStart, bestEnd = start, end
+			break
+		}
+		if end <= start {
+			start++
+		} else {
+			start = end
+		}
+	}
+	return bestStart, bestEnd
+}
+
+func (m *fuzzyMatcher) MatchAll(b []byte, dst []Match) []Match {
+	start, end := m.Match(b)
+	if start >= 0 {
+		dst = append(dst, Match{Start: start, End: end})
+	}
+	return dst
+}
+
+func editDistanceAtMost(a, b string, max int) bool {
+	if len(a)-len(b) > max || len(b)-len(a) > max {
+		return false
+	}
+	prev := make([]int, len(b)+1)
+	cur := make([]int, len(b)+1)
+	for j := range prev {
+		prev[j] = j
+	}
+	for i := 1; i <= len(a); i++ {
+		cur[0] = i
+		rowMin := cur[0]
+		for j := 1; j <= len(b); j++ {
+			cost := 0
+			if a[i-1] != b[j-1] {
+				cost = 1
+			}
+			cur[j] = minInt(prev[j]+1, cur[j-1]+1, prev[j-1]+cost)
+			if i > 1 && j > 1 && a[i-1] == b[j-2] && a[i-2] == b[j-1] {
+				cur[j] = minInt(cur[j], prev[j-2]+1)
+			}
+			if cur[j] < rowMin {
+				rowMin = cur[j]
+			}
+		}
+		if rowMin > max {
+			return false
+		}
+		prev, cur = cur, prev
+	}
+	return prev[len(b)] <= max
+}
+
+func minInt(v int, rest ...int) int {
+	for _, x := range rest {
+		if x < v {
+			v = x
+		}
+	}
+	return v
 }
 
 // Match is a byte range [Start, End).
@@ -348,6 +601,48 @@ func NewRegex(pattern string, ignoreCase bool) (Matcher, error) {
 	}
 
 	return &regexMatcher{re: re, prefix: prefix}, nil
+}
+
+type regexp2Matcher struct {
+	re *regexp2.Regexp
+}
+
+// NewAdvancedRegex compiles pattern with regexp2. It supports many PCRE-style
+// constructs that Go's regexp package intentionally omits, including
+// lookaround and backreferences.
+func NewAdvancedRegex(pattern string, ignoreCase bool) (Matcher, error) {
+	opts := regexp2.RegexOptions(0)
+	if ignoreCase {
+		opts |= regexp2.IgnoreCase
+	}
+	re, err := regexp2.Compile(pattern, opts)
+	if err != nil {
+		return nil, err
+	}
+	return &regexp2Matcher{re: re}, nil
+}
+
+func (m *regexp2Matcher) Match(b []byte) (int, int) {
+	text := string(b)
+	match, err := m.re.FindStringMatch(text)
+	if err != nil || match == nil {
+		return -1, -1
+	}
+	start := len([]byte(text[:match.Index]))
+	end := len([]byte(text[:match.Index+match.Length]))
+	return start, end
+}
+
+func (m *regexp2Matcher) MatchAll(b []byte, dst []Match) []Match {
+	text := string(b)
+	match, err := m.re.FindStringMatch(text)
+	for err == nil && match != nil {
+		start := len([]byte(text[:match.Index]))
+		end := len([]byte(text[:match.Index+match.Length]))
+		dst = append(dst, Match{Start: start, End: end})
+		match, err = m.re.FindNextMatch(match)
+	}
+	return dst
 }
 
 // LiteralPrefix returns a required case-sensitive literal prefix when the

@@ -90,7 +90,7 @@ func TestReorderNewValueFlagsBeforePositionals(t *testing.T) {
 
 func TestConfigExpansion(t *testing.T) {
 	dir := t.TempDir()
-	config := filepath.Join(dir, "zrep.conf")
+	config := filepath.Join(dir, "zrep.flags")
 	mustWrite(t, config, `
 # zrep config supports shell-like quotes and comments.
 -F
@@ -107,9 +107,173 @@ func TestConfigExpansion(t *testing.T) {
 	}
 }
 
+func TestBCLConfigProfiles(t *testing.T) {
+	dir := t.TempDir()
+	config := filepath.Join(dir, "zrep.bcl")
+	mustWrite(t, config, `global ["-F", "--sort", "path"]
+profiles {
+  code ["--glob", "*.go", "--sort", "path"]
+  logs ["--passthru", "--max-count", "1"]
+}
+`)
+	mustWrite(t, filepath.Join(dir, "a.txt"), "TODO TODO\n")
+	mustWrite(t, filepath.Join(dir, "main.go"), "TODO go\n")
+
+	out := runZrepEnv(t, []string{"ZREP_NO_CONFIG=0"}, "--config", config, "TODO", dir)
+	if !strings.Contains(out, "a.txt") || !strings.Contains(out, "main.go") {
+		t.Fatalf("global BCL config output = %q", out)
+	}
+
+	out = runZrepEnv(t, []string{"ZREP_NO_CONFIG=0"}, "--config", config, "--profile", "code", "TODO", dir)
+	if !strings.Contains(out, "main.go") || strings.Contains(out, "a.txt") {
+		t.Fatalf("profile BCL config output = %q", out)
+	}
+
+	out = runZrepEnv(t, []string{"ZREP_NO_CONFIG=0"}, "--config", config, "--config-id", "logs", "TODO", filepath.Join(dir, "a.txt"))
+	if !strings.Contains(out, "TODO TODO") {
+		t.Fatalf("config-id BCL config output = %q", out)
+	}
+}
+
+func TestBCLConfigEnvProfileAndMissingProfile(t *testing.T) {
+	dir := t.TempDir()
+	config := filepath.Join(dir, "zrep.bcl")
+	mustWrite(t, config, `global ["-F"]
+profiles {
+  code ["--glob", "*.go"]
+}
+`)
+	mustWrite(t, filepath.Join(dir, "a.txt"), "TODO txt\n")
+	mustWrite(t, filepath.Join(dir, "main.go"), "TODO go\n")
+
+	out := runZrepEnv(t, []string{"ZREP_CONFIG_PATH=" + config, "ZREP_PROFILE=code", "ZREP_NO_CONFIG=0"}, "TODO", dir)
+	if !strings.Contains(out, "main.go") || strings.Contains(out, "a.txt") {
+		t.Fatalf("env profile output = %q", out)
+	}
+
+	cmd := exec.Command("go", "run", ".", "--config", config, "--profile", "missing", "TODO", dir)
+	cmd.Env = testEnv("ZREP_NO_CONFIG=0")
+	outBytes, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected missing profile to fail, output:\n%s", outBytes)
+	}
+	if !strings.Contains(string(outBytes), `config profile "missing" not found`) {
+		t.Fatalf("missing profile output = %s", outBytes)
+	}
+}
+
+func TestBCLProfileUsesDefaultConfigWithoutConfigFlag(t *testing.T) {
+	dir := t.TempDir()
+	xdg := filepath.Join(dir, "xdg")
+	configDir := filepath.Join(xdg, "zrep")
+	config := filepath.Join(configDir, "config.bcl")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, config, `global ["-F", "--sort", "path"]
+profiles {
+  code ["--glob", "*.go"]
+  logs ["--passthru", "--max-count", "1"]
+}
+`)
+	mustWrite(t, filepath.Join(dir, "a.txt"), "TODO txt\n")
+	mustWrite(t, filepath.Join(dir, "main.go"), "TODO go\n")
+
+	out := runZrepEnv(t, []string{"XDG_CONFIG_HOME=" + xdg, "ZREP_NO_CONFIG=0"}, "--profile", "code", "TODO", dir)
+	if !strings.Contains(out, "main.go") || strings.Contains(out, "a.txt") {
+		t.Fatalf("default profile output = %q", out)
+	}
+
+	out = runZrepEnv(t, []string{"XDG_CONFIG_HOME=" + xdg, "ZREP_NO_CONFIG=0"}, "--config-id", "logs", "TODO", filepath.Join(dir, "a.txt"))
+	if !strings.Contains(out, "TODO txt") {
+		t.Fatalf("default config-id output = %q", out)
+	}
+}
+
+func TestBCLDefaultConfigEnvProfileAndMissingDefault(t *testing.T) {
+	dir := t.TempDir()
+	xdg := filepath.Join(dir, "xdg")
+	configDir := filepath.Join(xdg, "zrep")
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(configDir, "config.bcl"), `global ["-F"]
+profiles {
+  code ["--glob", "*.go"]
+}
+`)
+	mustWrite(t, filepath.Join(dir, "a.txt"), "TODO txt\n")
+	mustWrite(t, filepath.Join(dir, "main.go"), "TODO go\n")
+
+	out := runZrepEnv(t, []string{"XDG_CONFIG_HOME=" + xdg, "ZREP_PROFILE=code", "ZREP_NO_CONFIG=0"}, "TODO", dir)
+	if !strings.Contains(out, "main.go") || strings.Contains(out, "a.txt") {
+		t.Fatalf("default env profile output = %q", out)
+	}
+
+	missingXDG := filepath.Join(dir, "missing-xdg")
+	cmd := exec.Command("go", "run", ".", "--profile", "code", "TODO", dir)
+	cmd.Env = testEnv("XDG_CONFIG_HOME="+missingXDG, "ZREP_NO_CONFIG=0")
+	outBytes, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected missing default config to fail, output:\n%s", outBytes)
+	}
+	if !strings.Contains(string(outBytes), `config profile "code" requested but no default config was found`) {
+		t.Fatalf("missing default config output = %s", outBytes)
+	}
+}
+
+func TestBCLProfileManagementCommands(t *testing.T) {
+	dir := t.TempDir()
+	config := filepath.Join(dir, "config.bcl")
+
+	out := runZrepEnv(t, []string{"ZREP_NO_CONFIG=0"}, "--config", config, "profile", "import", "code", "--", "-F", "--glob", "*.go")
+	if !strings.Contains(out, `imported profile "code"`) {
+		t.Fatalf("import output = %q", out)
+	}
+
+	out = runZrepEnv(t, []string{"ZREP_NO_CONFIG=0"}, "--config", config, "profile", "list")
+	if strings.TrimSpace(out) != "code" {
+		t.Fatalf("list output = %q", out)
+	}
+
+	out = runZrepEnv(t, []string{"ZREP_NO_CONFIG=0"}, "--config", config, "profile", "update", "code", "--", "-F", "--glob", "*.ts")
+	if !strings.Contains(out, `updated profile "code"`) {
+		t.Fatalf("update output = %q", out)
+	}
+	b, err := os.ReadFile(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"*.ts"`) || strings.Contains(string(b), `"*.go"`) {
+		t.Fatalf("updated config = %s", b)
+	}
+
+	out = runZrepEnv(t, []string{"ZREP_NO_CONFIG=0"}, "--config", config, "profile", "remove", "code")
+	if !strings.Contains(out, `removed profile "code"`) {
+		t.Fatalf("remove output = %q", out)
+	}
+}
+
+func TestBCLProfileManagementUsesDefaultConfig(t *testing.T) {
+	dir := t.TempDir()
+	xdg := filepath.Join(dir, "xdg")
+	out := runZrepEnv(t, []string{"XDG_CONFIG_HOME=" + xdg, "ZREP_NO_CONFIG=0"}, "profile", "import", "logs", "--", "-F", "--passthru")
+	if !strings.Contains(out, `imported profile "logs"`) {
+		t.Fatalf("default import output = %q", out)
+	}
+	config := filepath.Join(xdg, "zrep", "config.bcl")
+	b, err := os.ReadFile(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "logs") || !strings.Contains(string(b), "--passthru") {
+		t.Fatalf("default config = %s", b)
+	}
+}
+
 func TestNoConfigDisablesConfigExpansion(t *testing.T) {
 	dir := t.TempDir()
-	config := filepath.Join(dir, "zrep.conf")
+	config := filepath.Join(dir, "zrep.flags")
 	mustWrite(t, config, "--files\n")
 	mustWrite(t, filepath.Join(dir, "a.txt"), "TODO\n")
 

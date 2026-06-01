@@ -5,6 +5,7 @@ import (
 	"archive/zip"
 	"bufio"
 	"bytes"
+	"compress/bzip2"
 	"compress/gzip"
 	"errors"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"sync"
 	"syscall"
 	"unicode/utf16"
+	"unicode/utf8"
 
 	"github.com/zrep/zrep/internal/matcher"
 )
@@ -70,7 +72,7 @@ func New(m matcher.Matcher) *Searcher {
 // IsSupportedArchive reports whether path can be searched by SearchArchive.
 func IsSupportedArchive(path string) bool {
 	ext := strings.ToLower(filepath.Ext(path))
-	return ext == ".gz" || ext == ".zip"
+	return ext == ".gz" || ext == ".tgz" || ext == ".bz2" || ext == ".zip"
 }
 
 // SearchFile searches a single file and returns its Result.
@@ -261,7 +263,9 @@ func (s *Searcher) SearchFileMultiline(path string, fileSize int64) Result {
 	if err != nil {
 		return Result{Path: path, Err: err}
 	}
-	defer cleanup()
+	if cleanup != nil {
+		defer cleanup()
+	}
 	if !s.SearchBinary && hasBinaryNull(firstBytes(buf, 8192)) {
 		return Result{Path: path}
 	}
@@ -288,6 +292,10 @@ func (s *Searcher) SearchArchive(path string) []Result {
 	switch ext {
 	case ".gz":
 		return []Result{s.searchGzip(path)}
+	case ".tgz":
+		return []Result{s.searchGzip(path)}
+	case ".bz2":
+		return []Result{s.searchBzip2(path)}
 	case ".zip":
 		return s.searchZip(path)
 	default:
@@ -382,7 +390,9 @@ func (s *Searcher) SearchFileOnlyLiteral(path string, fileSize int64, literal st
 	if err != nil {
 		return Result{Path: path, Err: err}
 	}
-	defer cleanup()
+	if cleanup != nil {
+		defer cleanup()
+	}
 
 	probe := buf
 	if len(probe) > 8192 {
@@ -591,7 +601,9 @@ func (s *Searcher) SearchFileCountExactLine(path string, fileSize int64, literal
 	if err != nil {
 		return Result{Path: path, Err: err}
 	}
-	defer cleanup()
+	if cleanup != nil {
+		defer cleanup()
+	}
 
 	probe := buf
 	if len(probe) > 8192 {
@@ -1129,6 +1141,14 @@ func lineAtOffset(buf []byte, offset int) (int, int) {
 func (s *Searcher) decodeText(buf []byte) ([]byte, bool) {
 	encoding := strings.ToLower(s.Encoding)
 	if encoding == "" || encoding == "auto" {
+		if len(buf) >= 4 {
+			if buf[0] == 0xff && buf[1] == 0xfe && buf[2] == 0x00 && buf[3] == 0x00 {
+				return decodeUTF32(buf[4:], true), true
+			}
+			if buf[0] == 0x00 && buf[1] == 0x00 && buf[2] == 0xfe && buf[3] == 0xff {
+				return decodeUTF32(buf[4:], false), true
+			}
+		}
 		if len(buf) >= 2 {
 			if buf[0] == 0xff && buf[1] == 0xfe {
 				return decodeUTF16(buf[2:], true), true
@@ -1136,6 +1156,15 @@ func (s *Searcher) decodeText(buf []byte) ([]byte, bool) {
 			if buf[0] == 0xfe && buf[1] == 0xff {
 				return decodeUTF16(buf[2:], false), true
 			}
+		}
+		if !utf8.Valid(buf) && looksLikeUTF16(buf, true) {
+			return decodeUTF16(buf, true), true
+		}
+		if !utf8.Valid(buf) && looksLikeUTF16(buf, false) {
+			return decodeUTF16(buf, false), true
+		}
+		if !utf8.Valid(buf) {
+			return decodeWindows1252(buf), true
 		}
 		return nil, false
 	}
@@ -1146,6 +1175,12 @@ func (s *Searcher) decodeText(buf []byte) ([]byte, bool) {
 		return decodeUTF16(trimUTF16BOM(buf), true), true
 	case "utf-16be", "utf16be":
 		return decodeUTF16(trimUTF16BOM(buf), false), true
+	case "utf-32le", "utf32le":
+		return decodeUTF32(trimUTF32BOM(buf), true), true
+	case "utf-32be", "utf32be":
+		return decodeUTF32(trimUTF32BOM(buf), false), true
+	case "latin1", "latin-1", "iso-8859-1", "windows-1252", "cp1252":
+		return decodeWindows1252(buf), true
 	default:
 		return nil, false
 	}
@@ -1170,6 +1205,113 @@ func decodeUTF16(buf []byte, littleEndian bool) []byte {
 	return []byte(string(utf16.Decode(u16)))
 }
 
+func trimUTF32BOM(buf []byte) []byte {
+	if len(buf) >= 4 && ((buf[0] == 0xff && buf[1] == 0xfe && buf[2] == 0x00 && buf[3] == 0x00) ||
+		(buf[0] == 0x00 && buf[1] == 0x00 && buf[2] == 0xfe && buf[3] == 0xff)) {
+		return buf[4:]
+	}
+	return buf
+}
+
+func decodeUTF32(buf []byte, littleEndian bool) []byte {
+	runes := make([]rune, 0, len(buf)/4)
+	for i := 0; i+3 < len(buf); i += 4 {
+		var r uint32
+		if littleEndian {
+			r = uint32(buf[i]) | uint32(buf[i+1])<<8 | uint32(buf[i+2])<<16 | uint32(buf[i+3])<<24
+		} else {
+			r = uint32(buf[i])<<24 | uint32(buf[i+1])<<16 | uint32(buf[i+2])<<8 | uint32(buf[i+3])
+		}
+		runes = append(runes, rune(r))
+	}
+	return []byte(string(runes))
+}
+
+func looksLikeUTF16(buf []byte, littleEndian bool) bool {
+	if len(buf) < 8 {
+		return false
+	}
+	zeros := 0
+	pairs := 0
+	for i := 0; i+1 < len(buf) && i < 4096; i += 2 {
+		pairs++
+		if littleEndian && buf[i+1] == 0 || !littleEndian && buf[i] == 0 {
+			zeros++
+		}
+	}
+	return pairs > 0 && zeros*100/pairs > 60
+}
+
+func decodeWindows1252(buf []byte) []byte {
+	var b strings.Builder
+	b.Grow(len(buf))
+	for _, c := range buf {
+		if c < 0x80 || c >= 0xa0 {
+			b.WriteRune(rune(c))
+			continue
+		}
+		switch c {
+		case 0x80:
+			b.WriteRune('€')
+		case 0x82:
+			b.WriteRune('‚')
+		case 0x83:
+			b.WriteRune('ƒ')
+		case 0x84:
+			b.WriteRune('„')
+		case 0x85:
+			b.WriteRune('…')
+		case 0x86:
+			b.WriteRune('†')
+		case 0x87:
+			b.WriteRune('‡')
+		case 0x88:
+			b.WriteRune('ˆ')
+		case 0x89:
+			b.WriteRune('‰')
+		case 0x8a:
+			b.WriteRune('Š')
+		case 0x8b:
+			b.WriteRune('‹')
+		case 0x8c:
+			b.WriteRune('Œ')
+		case 0x8e:
+			b.WriteRune('Ž')
+		case 0x91:
+			b.WriteRune('‘')
+		case 0x92:
+			b.WriteRune('’')
+		case 0x93:
+			b.WriteRune('“')
+		case 0x94:
+			b.WriteRune('”')
+		case 0x95:
+			b.WriteRune('•')
+		case 0x96:
+			b.WriteRune('–')
+		case 0x97:
+			b.WriteRune('—')
+		case 0x98:
+			b.WriteRune('˜')
+		case 0x99:
+			b.WriteRune('™')
+		case 0x9a:
+			b.WriteRune('š')
+		case 0x9b:
+			b.WriteRune('›')
+		case 0x9c:
+			b.WriteRune('œ')
+		case 0x9e:
+			b.WriteRune('ž')
+		case 0x9f:
+			b.WriteRune('Ÿ')
+		default:
+			b.WriteRune(rune(c))
+		}
+	}
+	return []byte(b.String())
+}
+
 func (s *Searcher) searchGzip(path string) Result {
 	f, err := os.Open(path)
 	if err != nil {
@@ -1182,6 +1324,19 @@ func (s *Searcher) searchGzip(path string) Result {
 	}
 	defer gr.Close()
 	buf, err := io.ReadAll(gr)
+	if err != nil {
+		return Result{Path: path, Err: err}
+	}
+	return s.searchBuffer(path, buf)
+}
+
+func (s *Searcher) searchBzip2(path string) Result {
+	f, err := os.Open(path)
+	if err != nil {
+		return Result{Path: path, Err: err}
+	}
+	defer f.Close()
+	buf, err := io.ReadAll(bzip2.NewReader(f))
 	if err != nil {
 		return Result{Path: path, Err: err}
 	}

@@ -48,12 +48,14 @@ func IsDefaultIgnoredName(name string) bool {
 // Walker walks directories in parallel.
 type Walker struct {
 	Filter  Filter
+	Follow  bool
 	Results chan Entry
 
 	workers int
 	wg      sync.WaitGroup
 	active  int64 // number of in-flight work items
 	queue   chan string
+	seen    sync.Map
 }
 
 // New creates a Walker.
@@ -115,6 +117,14 @@ func (w *Walker) enqueue(path string) {
 }
 
 func (w *Walker) processPath(path string) {
+	if w.Follow {
+		if realPath, err := filepath.EvalSymlinks(path); err == nil {
+			if _, loaded := w.seen.LoadOrStore(realPath, true); loaded {
+				return
+			}
+			path = realPath
+		}
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return
@@ -139,6 +149,14 @@ func (w *Walker) processPath(path string) {
 		entries, err := f.ReadDir(batchSize)
 		for _, de := range entries {
 			childPath := filepath.Join(path, de.Name())
+			if de.Type()&fs.ModeSymlink != 0 && w.Follow {
+				if realPath, err := filepath.EvalSymlinks(childPath); err == nil {
+					childPath = realPath
+					if info, err := os.Stat(childPath); err == nil {
+						de = fileInfoDirEntry{info: info}
+					}
+				}
+			}
 			filter := w.Filter
 			if filter != nil && !filter(childPath, de) {
 				continue
@@ -162,3 +180,12 @@ func (w *Walker) processPath(path string) {
 	}
 	f.Close()
 }
+
+type fileInfoDirEntry struct {
+	info fs.FileInfo
+}
+
+func (d fileInfoDirEntry) Name() string               { return d.info.Name() }
+func (d fileInfoDirEntry) IsDir() bool                { return d.info.IsDir() }
+func (d fileInfoDirEntry) Type() fs.FileMode          { return d.info.Mode().Type() }
+func (d fileInfoDirEntry) Info() (fs.FileInfo, error) { return d.info, nil }

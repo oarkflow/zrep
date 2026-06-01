@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"fmt"
 	"io"
 	"os"
@@ -15,6 +16,8 @@ const benchPattern = "ZREP_NEEDLE"
 type benchCorpus struct {
 	dir         string
 	patternFile string
+	gzipFile    string
+	csvFile     string
 	bytes       int64
 }
 
@@ -168,6 +171,28 @@ func BenchmarkZrepVsRipgrep(b *testing.B) {
 			zrepArgs: []string{"-F", "--json-events", "-no-color", benchPattern, corpus.dir},
 			rgArgs:   []string{"--fixed-strings", "--json", "--color=never", "--no-messages", "--no-ignore", benchPattern, corpus.dir},
 		},
+		{
+			name:     "max-filesize-count",
+			zrepArgs: []string{"-F", "-c", "--max-filesize", "2M", "-no-color", benchPattern, corpus.dir},
+			rgArgs:   []string{"--fixed-strings", "--count", "--max-filesize", "2M", "--color=never", "--no-messages", "--no-ignore", benchPattern, corpus.dir},
+		},
+		{
+			name:     "advanced-regex",
+			zrepArgs: []string{"-P", "-c", "-no-color", `(?<=marker=)ZREP_NEEDLE`, corpus.dir},
+			rgArgs:   []string{"--pcre2", "--count", "--color=never", "--no-messages", "--no-ignore", `(?<=marker=)ZREP_NEEDLE`, corpus.dir},
+		},
+		{
+			name:     "compressed-gzip",
+			zrepArgs: []string{"-F", "--search-compressed", "-c", "-no-color", benchPattern, corpus.gzipFile},
+		},
+		{
+			name:     "fuzzy-count",
+			zrepArgs: []string{"--fuzzy", "--distance", "2", "-c", "-no-color", "ZREP_NEEDL", corpus.dir},
+		},
+		{
+			name:     "schema-csv",
+			zrepArgs: []string{"--schema", corpus.csvFile},
+		},
 	}
 
 	for _, op := range ops {
@@ -176,6 +201,9 @@ func BenchmarkZrepVsRipgrep(b *testing.B) {
 			b.SetBytes(corpus.bytes)
 			runBenchCommand(b, zrep, op.zrepArgs...)
 		})
+		if len(op.rgArgs) == 0 {
+			continue
+		}
 		if rgErr != nil {
 			b.Logf("rg not found in PATH; skipping ripgrep comparison for %s: %v", op.name, rgErr)
 			continue
@@ -278,6 +306,31 @@ func createBenchCorpus(tb testing.TB) benchCorpus {
 	if err := os.WriteFile(patternFile, []byte(benchPattern+"\ntheta\n"), 0o644); err != nil {
 		tb.Fatalf("write benchmark pattern file: %v", err)
 	}
+	gzipFile := filepath.Join(dir, "logs", "bench.gz")
+	if err := writeBenchGzip(gzipFile, benchPattern+"\n"); err != nil {
+		tb.Fatalf("write benchmark gzip corpus file: %v", err)
+	}
+	csvFile := filepath.Join(dir, "data.csv")
+	if err := os.WriteFile(csvFile, []byte("id,login,note\n1,ada,"+benchPattern+"\n2,bob,plain\n"), 0o644); err != nil {
+		tb.Fatalf("write benchmark csv corpus file: %v", err)
+	}
 
-	return benchCorpus{dir: dir, patternFile: patternFile, bytes: total}
+	return benchCorpus{dir: dir, patternFile: patternFile, gzipFile: gzipFile, csvFile: csvFile, bytes: total}
+}
+
+func writeBenchGzip(path, text string) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	gw := gzip.NewWriter(f)
+	if _, err := gw.Write([]byte(text)); err != nil {
+		f.Close()
+		return err
+	}
+	if err := gw.Close(); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }

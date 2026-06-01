@@ -17,8 +17,11 @@ package main
 
 import (
 	"bufio"
+	"encoding/csv"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path"
@@ -27,11 +30,13 @@ import (
 	"runtime"
 	"runtime/pprof"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/oarkflow/bcl"
 	"github.com/zrep/zrep/internal/matcher"
 	"github.com/zrep/zrep/internal/output"
 	"github.com/zrep/zrep/internal/searcher"
@@ -81,6 +86,28 @@ var (
 	flagDebug             = flag.Bool("debug", false, "print debug messages to stderr")
 	flagVersion           = flag.Bool("version", false, "print version and exit")
 	flagNoConfig          = flag.Bool("no-config", false, "do not read zrep config files")
+	flagProfile           = flag.String("profile", "", "apply a named config profile")
+	flagPCRE2             = flag.Bool("pcre2", false, "use pure-Go advanced regex compatibility mode")
+	flagFollow            = flag.Bool("follow", false, "follow symbolic links")
+	flagMaxFileSize       = flag.String("max-filesize", "", "skip files larger than SIZE (K, M, G, T supported)")
+	flagSearchCompressed  = flag.Bool("search-compressed", false, "search supported compressed files")
+	flagFuzzy             = flag.Bool("fuzzy", false, "use approximate fuzzy matching")
+	flagDistance          = flag.Int("distance", 2, "maximum fuzzy edit distance")
+	flagBoolean           = flag.Bool("boolean", false, "parse pattern as a boolean expression")
+	flagSemantic          = flag.Bool("semantic", false, "use local lexical semantic matching")
+	flagLogs              = flag.Bool("logs", false, "parse lines as logs for time filtering and aggregation")
+	flagSince             = flag.String("since", "", "only include logs since duration or time")
+	flagFrom              = flag.String("from", "", "only include logs from time")
+	flagTo                = flag.String("to", "", "only include logs until time")
+	flagGroupBy           = flag.String("group-by", "", "group log or data results by field")
+	flagHistogram         = flag.String("histogram", "", "print histogram by minute, hour, or day")
+	flagWatch             = flag.Bool("watch", false, "watch files and rerun search")
+	flagSchema            = flag.Bool("schema", false, "print discovered schema")
+	flagProfileData       = flag.Bool("profile-data", false, "profile structured data")
+	flagJQ                = flag.String("jq", "", "filter JSON/JSONL with a small FIELD==VALUE expression")
+	flagSQL               = flag.String("sql", "", "query CSV/JSONL with a small SELECT ... WHERE ... expression")
+	flagOutput            = flag.String("output", "", "alias for -format in inspect/data modes")
+	flagTUI               = flag.Bool("tui", false, "open interactive terminal UI")
 	flagJSONEvents        = flag.Bool("json-events", false, "print ripgrep-style JSON event records")
 	flagSort              = flag.String("sort", "", "sort by path, modified, or size")
 	flagSortReverse       = flag.String("sortr", "", "reverse sort by path, modified, or size")
@@ -121,7 +148,13 @@ var (
 	flagTypes             patternList
 	flagTypeExcludes      patternList
 	flagTypeAdds          patternList
+	flagIgnoreFiles       patternList
 )
+
+type zrepBCLConfig struct {
+	Global   []string            `bcl:"global" json:"global"`
+	Profiles map[string][]string `bcl:"profiles" json:"profiles"`
+}
 
 func main() {
 	flag.Usage = func() {
@@ -142,6 +175,7 @@ Flags:
 	flag.Var(&flagGlobs, "glob", "include glob, or exclude with !GLOB; may be repeated")
 	flag.Var(&flagIncludes, "include", "include only files matching glob; may be repeated")
 	flag.Var(&flagExcludes, "exclude", "exclude files or directories matching glob; may be repeated")
+	flag.Var(&flagIgnoreFiles, "ignore-file", "read ignore globs from file; may be repeated")
 	flag.Var(&flagIncludeDirs, "include-dir", "include only files under matching directories; may be repeated")
 	flag.Var(&flagExcludeDirs, "exclude-dir", "exclude directories matching glob; may be repeated")
 	flag.Var(&flagTypes, "t", "include files of type (go, js, ts, py, rust, java, c, cpp, md, json); may be repeated")
@@ -160,21 +194,39 @@ Flags:
 	started := time.Now()
 
 	args := flag.Args()
+	if *flagOutput != "" {
+		*flagFormat = *flagOutput
+	}
 	if *flagVersion {
 		fmt.Println("zrep dev")
 		return
+	}
+	if len(args) > 0 && runStateCommand(args) {
+		return
+	}
+	if *flagTUI {
+		fmt.Fprintln(os.Stderr, "zrep: --tui is reserved for the pure-Go interactive UI; use normal search flags for now")
+		os.Exit(2)
+	}
+	if *flagWatch {
+		fmt.Fprintln(os.Stderr, "zrep: --watch is reserved for live rerun/tail mode; use normal search flags for now")
+		os.Exit(2)
 	}
 	if *flagTypeList {
 		printTypeList()
 		return
 	}
-	if hasInspectOperation() {
+	if hasDataOperation() {
 		if *flagSample == 0 && flagLookupChanged("limit") {
 			*flagSample = *flagLimit
 		}
 		roots := args
 		if len(roots) == 0 {
 			roots = []string{"."}
+		}
+		if *flagSchema || *flagProfileData || *flagJQ != "" || *flagSQL != "" {
+			runDataExplorer(roots)
+			return
 		}
 		runInspect(roots)
 		return
@@ -211,6 +263,10 @@ Flags:
 	}
 	if *flagSmartCase && !*flagIgnoreCase && allLowerPatterns(patterns) {
 		*flagIgnoreCase = true
+	}
+	if *flagLogs && (*flagGroupBy != "" || *flagHistogram != "") {
+		runLogSummary(patterns, roots)
+		return
 	}
 
 	// CPU profiling
@@ -289,7 +345,7 @@ Flags:
 		s := searcher.New(m)
 		s.SearchBinary = *flagText || *flagPassthru
 		s.Encoding = *flagEncoding
-		if *flagSearchArchives && searcher.IsSupportedArchive(entry.Path) {
+		if (*flagSearchArchives || *flagSearchCompressed) && searcher.IsSupportedArchive(entry.Path) {
 			matchedAny := false
 			for _, r := range s.SearchArchive(entry.Path) {
 				matched := resultMatches(r) > 0 || len(r.Matches) > 0 || len(r.OnlyMatch) > 0
@@ -376,6 +432,7 @@ Flags:
 
 	w := walker.New(workers)
 	w.Filter = buildPathFilter()
+	w.Follow = *flagFollow
 	w.Walk(roots...)
 
 	for i := 0; i < numSearchers; i++ {
@@ -419,11 +476,17 @@ func expandConfigArgs(args []string) ([]string, error) {
 	if len(args) == 0 {
 		return args, nil
 	}
+	if isConfigManagementCommand(args) {
+		return args, nil
+	}
 	if configDisabled(args) {
 		return args, nil
 	}
-	configPaths := defaultConfigPaths()
-	configPaths = append(configPaths, explicitConfigPaths(args)...)
+	profile := selectedConfigProfile(args)
+	configPaths, err := configPathsForArgs(args, profile)
+	if err != nil {
+		return nil, err
+	}
 	if len(configPaths) == 0 {
 		return args, nil
 	}
@@ -434,11 +497,8 @@ func expandConfigArgs(args []string) ([]string, error) {
 			continue
 		}
 		seen[path] = true
-		tokens, err := readConfigArgs(path)
+		tokens, err := readConfigArgs(path, profile)
 		if err != nil {
-			if isDefaultConfigPath(path) && os.IsNotExist(err) {
-				continue
-			}
 			return nil, err
 		}
 		configArgs = append(configArgs, tokens...)
@@ -449,8 +509,48 @@ func expandConfigArgs(args []string) ([]string, error) {
 	out := make([]string, 0, len(args)+len(configArgs))
 	out = append(out, args[0])
 	out = append(out, configArgs...)
-	out = append(out, args[1:]...)
+	out = append(out, stripProfileArgs(args[1:])...)
 	return out, nil
+}
+
+func isConfigManagementCommand(args []string) bool {
+	valueFlags := flagsWithValues()
+	for i := 1; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			return false
+		}
+		if looksLikeFlag(arg) {
+			if flagNeedsValue(arg, valueFlags) && i+1 < len(args) {
+				i++
+			}
+			continue
+		}
+		switch arg {
+		case "profile", "profiles", "config-profile":
+			return true
+		default:
+			return false
+		}
+	}
+	return false
+}
+
+func configPathsForArgs(args []string, profile string) ([]string, error) {
+	if explicit := explicitConfigPaths(args); len(explicit) > 0 {
+		return explicit, nil
+	}
+	if env := envConfigPaths(); len(env) > 0 {
+		return env, nil
+	}
+	if profile == "" {
+		return nil, nil
+	}
+	path, ok := firstExistingDefaultBCLConfigPath()
+	if !ok {
+		return nil, fmt.Errorf("config profile %q requested but no default config was found; create %s or pass --config", profile, strings.Join(defaultBCLConfigPaths(), " or "))
+	}
+	return []string{path}, nil
 }
 
 func configDisabled(args []string) bool {
@@ -474,11 +574,36 @@ func envTruthy(value string) bool {
 	}
 }
 
-func defaultConfigPaths() []string {
+func envConfigPaths() []string {
 	if path := os.Getenv("ZREP_CONFIG_PATH"); path != "" {
 		return splitConfigPathList(path)
 	}
 	return nil
+}
+
+func defaultBCLConfigPaths() []string {
+	paths := make([]string, 0, 2)
+	if xdg := strings.TrimSpace(os.Getenv("XDG_CONFIG_HOME")); xdg != "" {
+		paths = append(paths, filepath.Join(xdg, "zrep", "config.bcl"))
+	} else if home, err := os.UserHomeDir(); err == nil && home != "" {
+		paths = append(paths, filepath.Join(home, ".config", "zrep", "config.bcl"))
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		paths = append(paths, filepath.Join(home, ".zrep.bcl"))
+	}
+	return paths
+}
+
+func firstExistingDefaultBCLConfigPath() (string, bool) {
+	for _, path := range defaultBCLConfigPaths() {
+		if path == "" {
+			continue
+		}
+		if info, err := os.Stat(path); err == nil && !info.IsDir() {
+			return path, true
+		}
+	}
+	return "", false
 }
 
 func splitConfigPathList(value string) []string {
@@ -515,16 +640,53 @@ func explicitConfigPaths(args []string) []string {
 	return paths
 }
 
-func isDefaultConfigPath(path string) bool {
-	for _, candidate := range defaultConfigPaths() {
-		if candidate == path {
-			return true
+func selectedConfigProfile(args []string) string {
+	profile := strings.TrimSpace(os.Getenv("ZREP_PROFILE"))
+	for i := 1; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--profile" || arg == "-profile" || arg == "--config-id" || arg == "-config-id" {
+			if i+1 < len(args) {
+				profile = args[i+1]
+				i++
+			}
+			continue
+		}
+		for _, prefix := range []string{"--profile=", "-profile=", "--config-id=", "-config-id="} {
+			if value, ok := strings.CutPrefix(arg, prefix); ok {
+				profile = value
+				break
+			}
 		}
 	}
-	return false
+	return strings.TrimSpace(profile)
 }
 
-func readConfigArgs(path string) ([]string, error) {
+func stripProfileArgs(args []string) []string {
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--profile" || arg == "-profile" || arg == "--config-id" || arg == "-config-id" {
+			if i+1 < len(args) {
+				i++
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "--profile=") || strings.HasPrefix(arg, "-profile=") ||
+			strings.HasPrefix(arg, "--config-id=") || strings.HasPrefix(arg, "-config-id=") {
+			continue
+		}
+		out = append(out, arg)
+	}
+	return out
+}
+
+func readConfigArgs(path, profile string) ([]string, error) {
+	if strings.EqualFold(filepath.Ext(path), ".bcl") {
+		return readBCLConfigArgs(path, profile)
+	}
+	if profile != "" {
+		debugf("profile %q ignored for flat config %s", profile, path)
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -545,6 +707,23 @@ func readConfigArgs(path string) ([]string, error) {
 	if err := sc.Err(); err != nil {
 		return nil, err
 	}
+	return args, nil
+}
+
+func readBCLConfigArgs(path, profile string) ([]string, error) {
+	var cfg zrepBCLConfig
+	if err := bcl.DecodeFile(path, &cfg); err != nil {
+		return nil, err
+	}
+	args := append([]string(nil), cfg.Global...)
+	if profile == "" {
+		return args, nil
+	}
+	profileArgs, ok := cfg.Profiles[profile]
+	if !ok {
+		return nil, fmt.Errorf("config profile %q not found in %s", profile, path)
+	}
+	args = append(args, profileArgs...)
 	return args, nil
 }
 
@@ -660,7 +839,7 @@ func searchPath(s *searcher.Searcher, path string, size int64, patterns []string
 	if *flagWrite && *flagReplace != "" {
 		return s.ReplaceFile(path, size, *flagReplace)
 	}
-	if *flagSearchArchives && searcher.IsSupportedArchive(path) {
+	if (*flagSearchArchives || *flagSearchCompressed) && searcher.IsSupportedArchive(path) {
 		results := s.SearchArchive(path)
 		total := searcher.Result{Path: path}
 		for _, r := range results {
@@ -754,6 +933,7 @@ func runListFiles(roots []string) {
 func collectEntries(roots []string, workers int) []walker.Entry {
 	w := walker.New(workers)
 	w.Filter = buildPathFilter()
+	w.Follow = *flagFollow
 	w.Walk(roots...)
 	go w.Wait()
 	entries := make([]walker.Entry, 0, 1024)
@@ -838,6 +1018,7 @@ func exitForSearch(matched, failed bool) {
 }
 
 func registerShortAliases() {
+	flag.StringVar(flagProfile, "config-id", "", "alias for -profile")
 	flag.BoolVar(flagQuiet, "quiet", false, "alias for -q")
 	flag.IntVar(flagMaxCount, "max-count", 0, "alias for -m")
 	flag.BoolVar(flagFiles, "list-files", false, "alias for -files")
@@ -848,7 +1029,8 @@ func registerShortAliases() {
 	flag.BoolVar(flagStats, "s", false, "alias for -stats")
 	flag.BoolVar(flagJSON, "J", false, "alias for -json")
 	flag.BoolVar(flagVimgrep, "G", false, "alias for -vimgrep")
-	flag.BoolVar(flagPretty, "P", false, "alias for -pretty")
+	flag.BoolVar(flagPCRE2, "P", false, "alias for -pcre2")
+	flag.BoolVar(flagFollow, "L", false, "alias for -follow")
 	flag.BoolVar(flagInspect, "I", false, "alias for -inspect")
 	flag.BoolVar(flagRows, "R", false, "alias for -rows")
 	flag.BoolVar(flagColumns, "K", false, "alias for -columns")
@@ -859,7 +1041,6 @@ func registerShortAliases() {
 	flag.StringVar(flagReplace, "r", "", "alias for -replace")
 	flag.StringVar(flagEncoding, "E", "auto", "alias for -encoding")
 	flag.IntVar(flagSample, "N", 0, "alias for -sample")
-	flag.IntVar(flagLimit, "L", 0, "alias for -limit")
 }
 
 func expandShortFlagClusters(args []string) []string {
@@ -929,15 +1110,16 @@ func flagNeedsValue(arg string, valueFlags map[string]bool) bool {
 
 func flagsWithValues() map[string]bool {
 	return map[string]bool{
-		"A": true, "B": true, "C": true, "E": true, "L": true, "N": true,
+		"A": true, "B": true, "C": true, "E": true, "N": true,
 		"T": true, "e": true, "f": true, "g": true, "j": true, "m": true, "r": true, "t": true,
 		"cell-width": true,
-		"config":     true, "cpuprofile": true, "encoding": true, "exclude": true,
+		"config":     true, "config-id": true, "cpuprofile": true, "distance": true, "encoding": true, "exclude": true,
 		"exclude-dir": true, "file": true, "format": true, "glob": true, "include": true,
-		"include-dir": true, "limit": true, "max-columns": true,
-		"max-cell-width": true, "max-count": true, "path-separator": true, "replace": true,
-		"sample": true, "select": true, "sort": true, "sortr": true,
-		"type-add": true, "where": true,
+		"from": true, "group-by": true, "histogram": true, "ignore-file": true, "include-dir": true, "jq": true,
+		"limit": true, "max-columns": true, "max-filesize": true,
+		"max-cell-width": true, "max-count": true, "output": true, "path-separator": true, "profile": true, "replace": true,
+		"sample": true, "select": true, "since": true, "sort": true, "sortr": true, "sql": true,
+		"to": true, "type-add": true, "where": true,
 	}
 }
 
@@ -956,15 +1138,44 @@ func isShortCluster(arg string, boolFlags map[rune]bool) bool {
 func shortClusterBoolFlags() map[rune]bool {
 	return map[rune]bool{
 		'F': true, 'G': true, 'H': true, 'I': true, 'J': true, 'K': true,
-		'M': true, 'P': true, 'R': true, 'S': true, 'W': true, 'Y': true,
+		'L': true, 'M': true, 'P': true, 'R': true, 'S': true, 'W': true, 'Y': true,
 		'Z': true, 'c': true, 'h': true, 'i': true, 'j': true, 'l': true,
 		'n': true, 'o': true, 'q': true, 'r': true, 's': true, 'v': true, 'w': true, 'x': true,
 	}
 }
 
 func buildMatcher(patterns []string) (matcher.Matcher, bool, bool, error) {
+	if *flagFuzzy || *flagSemantic {
+		matchers := make([]matcher.Matcher, 0, len(patterns))
+		for _, pattern := range patterns {
+			matchers = append(matchers, matcher.NewFuzzy(pattern, *flagDistance))
+		}
+		return matcher.NewAny(matchers...), false, false, nil
+	}
+	if *flagBoolean {
+		matchers := make([]matcher.Matcher, 0, len(patterns))
+		for _, pattern := range patterns {
+			m, err := matcher.NewBoolean(pattern, *flagIgnoreCase)
+			if err != nil {
+				return nil, false, false, err
+			}
+			matchers = append(matchers, m)
+		}
+		return matcher.NewAny(matchers...), false, false, nil
+	}
 	fixedFast := *flagFixed && !*flagWord && !*flagLine
 	fixedWordFast := *flagFixed && *flagWord && !*flagLine
+	if *flagPCRE2 {
+		matchers := make([]matcher.Matcher, 0, len(patterns))
+		for _, pattern := range patterns {
+			m, err := matcher.NewAdvancedRegex(pattern, *flagIgnoreCase)
+			if err != nil {
+				return nil, false, false, err
+			}
+			matchers = append(matchers, m)
+		}
+		return matcher.NewAny(matchers...), false, false, nil
+	}
 	if fixedFast || fixedWordFast {
 		matchers := make([]matcher.Matcher, 0, len(patterns))
 		for _, pattern := range patterns {
@@ -1006,6 +1217,618 @@ func outputMode() string {
 
 func hasInspectOperation() bool {
 	return *flagInspect || *flagRows || *flagColumns || *flagSample > 0 || *flagLimit > 0 || *flagSelect != "" || *flagWhere != "" || *flagFlatten
+}
+
+func hasDataOperation() bool {
+	return hasInspectOperation() || *flagSchema || *flagProfileData || *flagJQ != "" || *flagSQL != ""
+}
+
+func runStateCommand(args []string) bool {
+	switch args[0] {
+	case "profile", "profiles", "config-profile":
+		if err := runProfileCommand(args[1:]); err != nil {
+			fmt.Fprintf(os.Stderr, "zrep: %v\n", err)
+			os.Exit(2)
+		}
+		return true
+	case "history":
+		fmt.Println("zrep: query history is not recorded yet")
+		return true
+	case "save":
+		if len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "zrep: save requires a name")
+			os.Exit(2)
+		}
+		fmt.Printf("zrep: saved search %q support is reserved for the config store\n", args[1])
+		return true
+	case "run":
+		if len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "zrep: run requires a saved search name")
+			os.Exit(2)
+		}
+		fmt.Fprintf(os.Stderr, "zrep: saved search %q not found\n", args[1])
+		os.Exit(2)
+	}
+	return false
+}
+
+func runProfileCommand(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("profile command requires import, update, remove, or list")
+	}
+	cfgPath, err := writableBCLConfigPath()
+	if err != nil {
+		return err
+	}
+	cmd := args[0]
+	switch cmd {
+	case "list":
+		cfg, err := readWritableBCLConfig(cfgPath)
+		if err != nil {
+			return err
+		}
+		names := make([]string, 0, len(cfg.Profiles))
+		for name := range cfg.Profiles {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			fmt.Println(name)
+		}
+		return nil
+	case "remove", "rm", "delete":
+		if len(args) < 2 {
+			return fmt.Errorf("profile remove requires an id")
+		}
+		cfg, err := readWritableBCLConfig(cfgPath)
+		if err != nil {
+			return err
+		}
+		id := strings.TrimSpace(args[1])
+		if _, ok := cfg.Profiles[id]; !ok {
+			return fmt.Errorf("config profile %q not found in %s", id, cfgPath)
+		}
+		delete(cfg.Profiles, id)
+		if err := writeBCLConfig(cfgPath, cfg); err != nil {
+			return err
+		}
+		fmt.Printf("removed profile %q from %s\n", id, cfgPath)
+		return nil
+	case "import", "add":
+		if len(args) < 3 {
+			return fmt.Errorf("profile import requires an id and flags")
+		}
+		id, profileArgs := args[1], cleanProfileCommandArgs(args[2:])
+		cfg, err := readWritableBCLConfig(cfgPath)
+		if err != nil {
+			return err
+		}
+		if _, exists := cfg.Profiles[id]; exists {
+			return fmt.Errorf("config profile %q already exists; use profile update", id)
+		}
+		cfg.Profiles[id] = profileArgs
+		if err := writeBCLConfig(cfgPath, cfg); err != nil {
+			return err
+		}
+		fmt.Printf("imported profile %q into %s\n", id, cfgPath)
+		return nil
+	case "update", "set":
+		if len(args) < 3 {
+			return fmt.Errorf("profile update requires an id and flags")
+		}
+		id, profileArgs := args[1], cleanProfileCommandArgs(args[2:])
+		cfg, err := readWritableBCLConfig(cfgPath)
+		if err != nil {
+			return err
+		}
+		cfg.Profiles[id] = profileArgs
+		if err := writeBCLConfig(cfgPath, cfg); err != nil {
+			return err
+		}
+		fmt.Printf("updated profile %q in %s\n", id, cfgPath)
+		return nil
+	default:
+		return fmt.Errorf("unknown profile command %q", cmd)
+	}
+}
+
+func cleanProfileCommandArgs(args []string) []string {
+	out := make([]string, 0, len(args))
+	for _, arg := range args {
+		if arg == "--" {
+			continue
+		}
+		out = append(out, arg)
+	}
+	return out
+}
+
+func writableBCLConfigPath() (string, error) {
+	if len(flagConfigFiles) > 0 {
+		path := flagConfigFiles[len(flagConfigFiles)-1]
+		if !strings.EqualFold(filepath.Ext(path), ".bcl") {
+			return "", fmt.Errorf("profile commands require a .bcl config file")
+		}
+		return path, nil
+	}
+	if env := envConfigPaths(); len(env) > 0 {
+		path := env[len(env)-1]
+		if !strings.EqualFold(filepath.Ext(path), ".bcl") {
+			return "", fmt.Errorf("profile commands require a .bcl config file")
+		}
+		return path, nil
+	}
+	if path, ok := firstExistingDefaultBCLConfigPath(); ok {
+		return path, nil
+	}
+	paths := defaultBCLConfigPaths()
+	if len(paths) == 0 {
+		return "", fmt.Errorf("could not determine default config path")
+	}
+	return paths[0], nil
+}
+
+func readWritableBCLConfig(path string) (zrepBCLConfig, error) {
+	cfg := zrepBCLConfig{Profiles: map[string][]string{}}
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return cfg, nil
+		}
+		return cfg, err
+	}
+	if err := bcl.DecodeFile(path, &cfg); err != nil {
+		return cfg, err
+	}
+	if cfg.Profiles == nil {
+		cfg.Profiles = map[string][]string{}
+	}
+	return cfg, nil
+}
+
+func writeBCLConfig(path string, cfg zrepBCLConfig) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	var b strings.Builder
+	writeBCLList(&b, "global", cfg.Global)
+	b.WriteString("\nprofiles {\n")
+	names := make([]string, 0, len(cfg.Profiles))
+	for name := range cfg.Profiles {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		b.WriteString("  ")
+		b.WriteString(name)
+		b.WriteByte(' ')
+		writeInlineBCLList(&b, cfg.Profiles[name])
+		b.WriteByte('\n')
+	}
+	b.WriteString("}\n")
+	return os.WriteFile(path, []byte(b.String()), 0o644)
+}
+
+func writeBCLList(b *strings.Builder, name string, values []string) {
+	b.WriteString(name)
+	b.WriteByte(' ')
+	writeInlineBCLList(b, values)
+	b.WriteByte('\n')
+}
+
+func writeInlineBCLList(b *strings.Builder, values []string) {
+	b.WriteByte('[')
+	for i, value := range values {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(strconv.Quote(value))
+	}
+	b.WriteByte(']')
+}
+
+func runDataExplorer(roots []string) {
+	workers := *flagWorkers
+	if workers <= 0 {
+		workers = runtime.GOMAXPROCS(0) * 2
+	}
+	entries := collectEntries(roots, workers)
+	sortEntries(entries, sortMode(), *flagSortReverse != "")
+	for _, entry := range entries {
+		if *flagSchema {
+			printSchema(entry.Path)
+		}
+		if *flagProfileData {
+			printDataProfile(entry.Path)
+		}
+		if *flagJQ != "" {
+			printJSONPredicate(entry.Path, *flagJQ)
+		}
+		if *flagSQL != "" {
+			printSQLQuery(entry.Path, *flagSQL)
+		}
+	}
+}
+
+func printSchema(file string) {
+	b, err := os.ReadFile(file)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "zrep: %v\n", err)
+		return
+	}
+	fmt.Printf("%s\n", formatOutputPath(file))
+	ext := strings.ToLower(filepath.Ext(file))
+	if ext == ".csv" || ext == ".tsv" {
+		r := csv.NewReader(strings.NewReader(string(b)))
+		if ext == ".tsv" {
+			r.Comma = '\t'
+		}
+		header, err := r.Read()
+		if err != nil {
+			fmt.Println("  kind: delimited")
+			return
+		}
+		for _, col := range header {
+			fmt.Printf("  %s string\n", col)
+		}
+		return
+	}
+	var v any
+	if err := json.Unmarshal(b, &v); err != nil {
+		fmt.Println("  kind: text")
+		return
+	}
+	for _, line := range schemaLines("", v) {
+		fmt.Println("  " + line)
+	}
+}
+
+func schemaLines(prefix string, v any) []string {
+	switch x := v.(type) {
+	case []any:
+		if len(x) == 0 {
+			return []string{prefix + " array"}
+		}
+		return schemaLines(prefix+"[]", x[0])
+	case map[string]any:
+		keys := make([]string, 0, len(x))
+		for k := range x {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		var out []string
+		for _, k := range keys {
+			name := k
+			if prefix != "" {
+				name = prefix + "." + k
+			}
+			out = append(out, schemaLines(name, x[k])...)
+		}
+		return out
+	case string:
+		return []string{prefix + " string"}
+	case bool:
+		return []string{prefix + " boolean"}
+	case float64:
+		return []string{prefix + " number"}
+	case nil:
+		return []string{prefix + " null"}
+	default:
+		return []string{prefix + " value"}
+	}
+}
+
+func printDataProfile(file string) {
+	f, err := os.Open(file)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "zrep: %v\n", err)
+		return
+	}
+	defer f.Close()
+	r := csv.NewReader(f)
+	if strings.EqualFold(filepath.Ext(file), ".tsv") {
+		r.Comma = '\t'
+	}
+	header, err := r.Read()
+	if err != nil {
+		fmt.Printf("%s\n  rows: 0\n", formatOutputPath(file))
+		return
+	}
+	uniques := make([]map[string]int, len(header))
+	nulls := make([]int, len(header))
+	for i := range uniques {
+		uniques[i] = map[string]int{}
+	}
+	rows := 0
+	for {
+		rec, err := r.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			break
+		}
+		rows++
+		for i := range header {
+			val := ""
+			if i < len(rec) {
+				val = rec[i]
+			}
+			if val == "" {
+				nulls[i]++
+			}
+			uniques[i][val]++
+		}
+	}
+	fmt.Printf("%s\n  rows: %d\n", formatOutputPath(file), rows)
+	for i, col := range header {
+		dupes := 0
+		for _, n := range uniques[i] {
+			if n > 1 {
+				dupes += n - 1
+			}
+		}
+		fmt.Printf("  %s nulls=%d uniques=%d duplicates=%d\n", col, nulls[i], len(uniques[i]), dupes)
+	}
+}
+
+func printJSONPredicate(file, expr string) {
+	field, value, ok := parseFieldPredicate(expr)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "zrep: unsupported --jq expression %q\n", expr)
+		return
+	}
+	for _, obj := range readJSONObjects(file) {
+		if fmt.Sprint(fieldValue(obj, field)) == value {
+			b, _ := json.Marshal(obj)
+			fmt.Println(string(b))
+		}
+	}
+}
+
+func printSQLQuery(file, query string) {
+	fields, whereField, whereValue := parseMiniSQL(query)
+	for _, obj := range readDelimitedObjects(file) {
+		if whereField != "" && fmt.Sprint(obj[whereField]) != whereValue {
+			continue
+		}
+		if len(fields) == 0 || fields[0] == "*" {
+			b, _ := json.Marshal(obj)
+			fmt.Println(string(b))
+			continue
+		}
+		row := make([]string, len(fields))
+		for i, f := range fields {
+			row[i] = fmt.Sprint(obj[f])
+		}
+		fmt.Println(strings.Join(row, ","))
+	}
+}
+
+func parseFieldPredicate(expr string) (string, string, bool) {
+	for _, op := range []string{"==", "="} {
+		if left, right, ok := strings.Cut(expr, op); ok {
+			return strings.Trim(strings.TrimSpace(left), "."), strings.Trim(strings.Trim(strings.TrimSpace(right), `"`), `'`), true
+		}
+	}
+	return "", "", false
+}
+
+func parseMiniSQL(query string) ([]string, string, string) {
+	upper := strings.ToUpper(query)
+	if !strings.HasPrefix(upper, "SELECT ") {
+		return nil, "", ""
+	}
+	body := strings.TrimSpace(query[len("SELECT "):])
+	selectPart := body
+	wherePart := ""
+	if idx := strings.Index(strings.ToUpper(body), " WHERE "); idx >= 0 {
+		selectPart = strings.TrimSpace(body[:idx])
+		wherePart = strings.TrimSpace(body[idx+7:])
+	}
+	fields := strings.Split(selectPart, ",")
+	for i := range fields {
+		fields[i] = strings.TrimSpace(fields[i])
+	}
+	field, value, _ := parseFieldPredicate(wherePart)
+	return fields, field, value
+}
+
+func readJSONObjects(file string) []map[string]any {
+	b, err := os.ReadFile(file)
+	if err != nil {
+		return nil
+	}
+	var arr []map[string]any
+	if json.Unmarshal(b, &arr) == nil {
+		return arr
+	}
+	var obj map[string]any
+	if json.Unmarshal(b, &obj) == nil {
+		return []map[string]any{obj}
+	}
+	var out []map[string]any
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		obj = map[string]any{}
+		if json.Unmarshal([]byte(line), &obj) == nil {
+			out = append(out, obj)
+		}
+	}
+	return out
+}
+
+func readDelimitedObjects(file string) []map[string]string {
+	f, err := os.Open(file)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	r := csv.NewReader(f)
+	if strings.EqualFold(filepath.Ext(file), ".tsv") {
+		r.Comma = '\t'
+	}
+	header, err := r.Read()
+	if err != nil {
+		return nil
+	}
+	var out []map[string]string
+	for {
+		rec, err := r.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			break
+		}
+		obj := map[string]string{}
+		for i, h := range header {
+			if i < len(rec) {
+				obj[h] = rec[i]
+			}
+		}
+		out = append(out, obj)
+	}
+	return out
+}
+
+func fieldValue(obj map[string]any, field string) any {
+	var cur any = obj
+	for _, part := range strings.Split(field, ".") {
+		m, ok := cur.(map[string]any)
+		if !ok {
+			return nil
+		}
+		cur = m[part]
+	}
+	return cur
+}
+
+func runLogSummary(patterns, roots []string) {
+	needle := ""
+	if len(patterns) > 0 {
+		needle = patterns[0]
+	}
+	counts := map[string]int{}
+	for _, entry := range collectEntries(roots, runtime.GOMAXPROCS(0)*2) {
+		f, err := os.Open(entry.Path)
+		if err != nil {
+			continue
+		}
+		sc := bufio.NewScanner(f)
+		for sc.Scan() {
+			line := sc.Text()
+			if needle != "" && !strings.Contains(line, needle) {
+				continue
+			}
+			if !logLineInRange(line) {
+				continue
+			}
+			key := "matches"
+			if *flagHistogram != "" {
+				key = histogramBucket(line, *flagHistogram)
+			} else if *flagGroupBy != "" {
+				key = logField(line, *flagGroupBy)
+			}
+			if key == "" {
+				key = "(missing)"
+			}
+			counts[key]++
+		}
+		f.Close()
+	}
+	keys := make([]string, 0, len(counts))
+	for k := range counts {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		fmt.Printf("%s %d\n", k, counts[k])
+	}
+}
+
+func logLineInRange(line string) bool {
+	ts, ok := parseLogTime(line)
+	if !ok {
+		return true
+	}
+	if *flagSince != "" {
+		if d, err := time.ParseDuration(*flagSince); err == nil && ts.Before(time.Now().Add(-d)) {
+			return false
+		}
+	}
+	if *flagFrom != "" {
+		if t, ok := parseUserTime(*flagFrom); ok && ts.Before(t) {
+			return false
+		}
+	}
+	if *flagTo != "" {
+		if t, ok := parseUserTime(*flagTo); ok && ts.After(t) {
+			return false
+		}
+	}
+	return true
+}
+
+func histogramBucket(line, unit string) string {
+	ts, ok := parseLogTime(line)
+	if !ok {
+		return "unknown"
+	}
+	switch strings.ToLower(unit) {
+	case "minute":
+		return ts.Format("2006-01-02 15:04")
+	case "day":
+		return ts.Format("2006-01-02")
+	default:
+		return ts.Format("2006-01-02 15:00")
+	}
+}
+
+func parseLogTime(line string) (time.Time, bool) {
+	fields := strings.Fields(line)
+	if len(fields) == 0 {
+		return time.Time{}, false
+	}
+	candidates := []string{fields[0]}
+	if len(fields) > 1 {
+		candidates = append(candidates, fields[0]+" "+fields[1])
+	}
+	for _, c := range candidates {
+		if t, ok := parseUserTime(strings.Trim(c, "[]")); ok {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
+
+func parseUserTime(value string) (time.Time, bool) {
+	for _, layout := range []string{time.RFC3339, "2006-01-02 15:04:05", "2006-01-02 15:04", "2006-01-02"} {
+		if t, err := time.ParseInLocation(layout, value, time.Local); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
+
+func logField(line, field string) string {
+	for _, part := range strings.Fields(line) {
+		if k, v, ok := strings.Cut(part, "="); ok && k == field {
+			return strings.Trim(v, `"'`)
+		}
+	}
+	if strings.EqualFold(field, "severity") || strings.EqualFold(field, "level") {
+		for _, part := range strings.Fields(line) {
+			up := strings.ToUpper(strings.Trim(part, "[]:"))
+			switch up {
+			case "TRACE", "DEBUG", "INFO", "WARN", "WARNING", "ERROR", "FATAL":
+				return up
+			}
+		}
+	}
+	return ""
 }
 
 func contextLines() (int, int) {
@@ -1055,6 +1878,14 @@ func buildPathFilter() walker.Filter {
 	includeTypeGlobs := buildTypeGlobs(flagTypes)
 	excludeTypeGlobs := buildTypeGlobs(flagTypeExcludes)
 	ignoreGlobs := buildIgnoreGlobs()
+	maxFileSize := int64(0)
+	if *flagMaxFileSize != "" {
+		var err error
+		maxFileSize, err = parseSize(*flagMaxFileSize)
+		if err != nil {
+			fatal(err)
+		}
+	}
 	cwd, _ := os.Getwd()
 
 	return func(path string, d fs.DirEntry) bool {
@@ -1075,6 +1906,12 @@ func buildPathFilter() walker.Filter {
 		if d.IsDir() {
 			return !matchesAnyPathGlob(path, name, excludeDirs, cwd) &&
 				!matchesAnyPathGlob(path, name, excludeFiles, cwd)
+		}
+		if maxFileSize > 0 {
+			if info, err := d.Info(); err == nil && info.Size() > maxFileSize {
+				debugf("skip max-filesize: %s", path)
+				return false
+			}
 		}
 
 		if len(includeDirs) > 0 && !pathHasMatchingDir(path, includeDirs, cwd) {
@@ -1106,7 +1943,7 @@ func buildIgnoreGlobs() []string {
 		return nil
 	}
 	var globs []string
-	for _, file := range []string{".gitignore", ".ignore", ".zrepignore"} {
+	for _, file := range append([]string{".gitignore", ".ignore", ".rgignore", ".zrepignore"}, []string(flagIgnoreFiles)...) {
 		b, err := os.ReadFile(file)
 		if err != nil {
 			continue
@@ -1128,6 +1965,34 @@ func buildIgnoreGlobs() []string {
 		}
 	}
 	return globs
+}
+
+func parseSize(value string) (int64, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, nil
+	}
+	mult := int64(1)
+	last := value[len(value)-1]
+	switch last {
+	case 'k', 'K':
+		mult = 1 << 10
+		value = value[:len(value)-1]
+	case 'm', 'M':
+		mult = 1 << 20
+		value = value[:len(value)-1]
+	case 'g', 'G':
+		mult = 1 << 30
+		value = value[:len(value)-1]
+	case 't', 'T':
+		mult = 1 << 40
+		value = value[:len(value)-1]
+	}
+	n, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("invalid --max-filesize %q", value)
+	}
+	return int64(n * float64(mult)), nil
 }
 
 func buildTypeGlobs(selected []string) []string {
@@ -1159,7 +2024,7 @@ func typeCatalog() map[string][]string {
 		"clojure":     {"*.clj", "*.cljs", "*.cljc", "*.edn"},
 		"cmake":       {"CMakeLists.txt", "*.cmake"},
 		"coffee":      {"*.coffee"},
-		"config":      {"*.conf", "*.config", "*.cfg", "*.cnf", "*.ini", "*.properties", "*.prefs"},
+		"config":      {"*.config", "*.cfg", "*.cnf", "*.ini", "*.properties", "*.prefs"},
 		"cpp":         {"*.cc", "*.cpp", "*.cxx", "*.c++", "*.hpp", "*.hh", "*.hxx", "*.h++"},
 		"csharp":      {"*.cs"},
 		"css":         {"*.css", "*.scss", "*.sass", "*.less"},

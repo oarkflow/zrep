@@ -17,10 +17,12 @@ import (
 )
 
 type flagFixture struct {
-	root    string
-	files   map[string]string
-	config  string
-	pattern string
+	root      string
+	files     map[string]string
+	config    string
+	bclConfig string
+	xdg       string
+	pattern   string
 }
 
 type zrepRun struct {
@@ -62,7 +64,7 @@ func TestFlagExamples(t *testing.T) {
 		{name: "line", flags: []string{"x"}, args: []string{"-F", "-x", "TODO", fx.path("lines.txt")}, wantStdout: "1:1-4\n    TODO\n"},
 		{name: "only matching", flags: []string{"o"}, args: []string{"-F", "-o", "TODO", fx.path("a.txt")}, wantStdout: "TODO\nTODO\nTODO\n"},
 		{name: "files with matches", flags: []string{"l"}, args: []string{"-F", "-l", "TODO", fx.root, "--sort", "path"}, wantStdoutHas: []string{"<ROOT>/a.txt\n", "<ROOT>/lines.txt\n"}},
-		{name: "files without match", flags: []string{"files-without-match", "without-match"}, args: []string{"-F", "--without-match", "TODO", fx.root, "--sort", "path"}, wantStdoutHas: []string{"<ROOT>/b.log\n", "<ROOT>/zrep.conf\n"}},
+		{name: "files without match", flags: []string{"files-without-match", "without-match"}, args: []string{"-F", "--without-match", "TODO", fx.root, "--sort", "path"}, wantStdoutHas: []string{"<ROOT>/b.log\n", "<ROOT>/zrep.flags\n"}},
 		{name: "files listing", flags: []string{"files", "list-files"}, args: []string{"--list-files", fx.root, "--sort", "path"}, wantStdoutHas: []string{"<ROOT>/a.txt\n", "<ROOT>/data.json\n"}},
 		{name: "count include zero", flags: []string{"c", "include-zero"}, args: []string{"-F", "-c", "TODO", fx.root, "--include-zero", "--sort", "path"}, wantStdoutHas: []string{"<ROOT>/a.txt:2\n", "<ROOT>/b.log:0\n"}},
 		{name: "count matches", flags: []string{"count-matches", "matches-count"}, args: []string{"-F", "--matches-count", "TODO", fx.path("a.txt")}, wantStdout: "3\n"},
@@ -76,15 +78,20 @@ func TestFlagExamples(t *testing.T) {
 		{name: "after context", flags: []string{"A"}, args: []string{"-F", "-A", "1", "TODO one", fx.path("a.txt")}, wantStdout: "1:7-14\n    alpha TODO one\n2:1\n    beta two\n"},
 		{name: "before context", flags: []string{"B"}, args: []string{"-F", "-B", "1", "TODO TODO", fx.path("a.txt")}, wantStdout: "2:1\n    beta two\n3:7-15\n    alpha TODO TODO three\n"},
 		{name: "context", flags: []string{"C"}, args: []string{"-F", "-C", "1", "TODO TODO", fx.path("a.txt")}, wantStdout: "2:1\n    beta two\n3:7-15\n    alpha TODO TODO three\n4:1\n    FIXME item\n"},
+		{name: "pcre2", flags: []string{"pcre2", "P"}, args: []string{"-P", `(?<=user=)\d+`, fx.path("advanced.txt")}, wantStdout: "1:6-7\n    user=42 action=login\n"},
+		{name: "fuzzy", flags: []string{"fuzzy", "distance"}, args: []string{"--fuzzy", "--distance", "2", "authrization", fx.path("advanced.txt")}, wantStdoutHas: []string{"authorization"}},
+		{name: "semantic", flags: []string{"semantic"}, args: []string{"--semantic", "authrization", fx.path("advanced.txt")}, wantStdoutHas: []string{"authorization"}},
+		{name: "boolean", flags: []string{"boolean"}, args: []string{"--boolean", "(error OR fatal) AND timeout", fx.path("advanced.txt")}, wantStdoutHas: []string{"fatal timeout"}},
 		{name: "json", flags: []string{"json", "J"}, args: []string{"-F", "-J", "TODO one", fx.path("a.txt")}, wantStdout: "{\"path\":\"<ROOT>/a.txt\",\"line\":1,\"column\":7,\"end_column\":14,\"context\":false,\"text\":\"alpha TODO one\"}\n"},
 		{name: "json events", flags: []string{"json-events"}, args: []string{"-F", "--json-events", "TODO one", fx.path("a.txt")}, wantStdoutHas: []string{`"type":"begin"`, `"type":"match"`, `"type":"end"`, `"type":"summary"`}},
 		{name: "vimgrep", flags: []string{"vimgrep", "G"}, args: []string{"-F", "-G", "TODO one", fx.path("a.txt")}, wantStdout: "<ROOT>/a.txt:1:7:alpha TODO one\n"},
 		{name: "heading", flags: []string{"heading"}, args: []string{"-F", "-H", "--heading", "TODO", fx.path("a.txt")}, wantStdout: "<ROOT>/a.txt\n1:7-10\n    alpha TODO one\n3:7-10\n    alpha TODO TODO three\n"},
-		{name: "pretty", flags: []string{"pretty", "P"}, args: []string{"-F", "-P", "TODO one", fx.path("a.txt")}, wantStdout: "1:7-14\n    alpha TODO one\n"},
+		{name: "pretty", flags: []string{"pretty"}, args: []string{"-F", "--pretty", "TODO one", fx.path("a.txt")}, wantStdout: "1:7-14\n    alpha TODO one\n"},
 		{name: "replace", flags: []string{"replace", "r"}, args: []string{"-F", "-r", "DONE", "TODO", fx.path("a.txt")}, wantStdout: "1:7-10\n    alpha DONE one\n3:7-10\n    alpha DONE DONE three\n"},
 		{name: "write", flags: []string{"write", "W"}, args: []string{"-F", "--replace", "DONE", "-W", "TODO", fx.copyPath(t, "write.txt", "TODO\n")}},
 		{name: "multiline", flags: []string{"multiline", "M"}, args: []string{"-M", "start(.|\n)*end", fx.path("multi.txt")}, wantStdout: "1:1-21\n    start\nmiddle TODO\nend\n"},
 		{name: "archive", flags: []string{"search-archives", "Z"}, args: []string{"-F", "-H", "-Z", "ZIPTODO", fx.path("archive.zip")}, wantStdout: "<ROOT>/archive.zip::inside.txt:1:1-7\n    ZIPTODO\n"},
+		{name: "compressed", flags: []string{"search-compressed"}, args: []string{"-F", "-H", "--search-compressed", "GZTODO", fx.path("archive.gz")}, wantStdout: "<ROOT>/archive.gz:1:1-6\n    GZTODO\n"},
 		{name: "encoding", flags: []string{"encoding", "E"}, args: []string{"-F", "-E", "utf-16le", "TODO", fx.path("utf16.txt")}, wantStdout: "1:1-4\n    TODO utf16\n"},
 		{name: "passthru", flags: []string{"passthru", "all-lines"}, args: []string{"-F", "--all-lines", "TODO one", fx.path("a.txt")}, wantStdout: "1:7-14\n    alpha TODO one\n2:1\n    beta two\n3:1\n    alpha TODO TODO three\n4:1\n    FIXME item\n"},
 		{name: "trim", flags: []string{"trim"}, args: []string{"-F", "--trim", "TODO", fx.path("space.txt")}, wantStdout: "1:1-4\n    TODO indented\n"},
@@ -95,10 +102,20 @@ func TestFlagExamples(t *testing.T) {
 		{name: "no messages", flags: []string{"no-messages"}, args: []string{"-F", "--no-messages", "TODO", fx.path("missing.txt")}},
 		{name: "debug", flags: []string{"debug"}, args: []string{"--debug", "--files", fx.root, "--sort", "path"}, wantStderrHas: []string{"zrep: debug: skip"}},
 		{name: "version", flags: []string{"version"}, args: []string{"--version"}, wantStdout: "zrep dev\n"},
+		{name: "follow symlink", flags: []string{"follow", "L"}, args: []string{"-F", "-L", "LINKTODO", fx.path("link-dir"), "--sort", "path"}, wantStdoutHas: []string{"LINKTODO"}},
+		{name: "max filesize", flags: []string{"max-filesize"}, args: []string{"--files", "--max-filesize", "10", "--include", "a.txt", fx.root}, wantStdout: ""},
+		{name: "ignore file", flags: []string{"ignore-file"}, args: []string{"-F", "--ignore-file", fx.path("custom.ignore"), "TODO", fx.root, "--sort", "path"}, wantStdoutHas: []string{"<ROOT>/lines.txt"}, wantStdout: ""},
 		{name: "config", flags: []string{"config"}, env: []string{"ZREP_NO_CONFIG=0"}, args: []string{"--config", fx.config, "TODO", fx.root}, wantStdout: "<ROOT>/a.txt:3\n"},
 		{name: "no config", flags: []string{"no-config"}, env: []string{"ZREP_CONFIG_PATH=" + fx.config, "ZREP_NO_CONFIG=0"}, args: []string{"--no-config", "-F", "TODO", fx.path("a.txt")}, wantStdout: "1:7-10\n    alpha TODO one\n3:7-10\n    alpha TODO TODO three\n"},
 		{name: "env config", flags: []string{"ZREP_CONFIG_PATH"}, env: []string{"ZREP_CONFIG_PATH=" + fx.config, "ZREP_NO_CONFIG=0"}, args: []string{"TODO", fx.root}, wantStdout: "<ROOT>/a.txt:3\n"},
 		{name: "env no config", flags: []string{"ZREP_NO_CONFIG"}, env: []string{"ZREP_CONFIG_PATH=" + fx.config, "ZREP_NO_CONFIG=1"}, args: []string{"-F", "TODO", fx.path("a.txt")}, wantStdout: "1:7-10\n    alpha TODO one\n3:7-10\n    alpha TODO TODO three\n"},
+		{name: "bcl global config", flags: []string{"profile"}, env: []string{"ZREP_NO_CONFIG=0"}, args: []string{"--config", fx.bclConfig, "TODO", fx.path("a.txt")}, wantStdout: "1:7-10\n    alpha TODO one\n3:7-10\n    alpha TODO TODO three\n"},
+		{name: "bcl profile", flags: []string{"profile"}, env: []string{"ZREP_NO_CONFIG=0"}, args: []string{"--config", fx.bclConfig, "--profile", "logs", "TODO", fx.path("a.txt")}, wantStdout: "1:7-10\n    alpha TODO one\n"},
+		{name: "bcl config id", flags: []string{"config-id"}, env: []string{"ZREP_NO_CONFIG=0"}, args: []string{"--config", fx.bclConfig, "--config-id", "code", "TODO", fx.root}, wantStdout: "<ROOT>/sub/c.log:1:1-4\n    TODO in log\n"},
+		{name: "bcl env profile", flags: []string{"ZREP_PROFILE"}, env: []string{"ZREP_CONFIG_PATH=" + fx.bclConfig, "ZREP_PROFILE=code", "ZREP_NO_CONFIG=0"}, args: []string{"TODO", fx.root}, wantStdout: "<ROOT>/sub/c.log:1:1-4\n    TODO in log\n"},
+		{name: "bcl default profile", flags: []string{"profile"}, env: []string{"XDG_CONFIG_HOME=" + fx.xdg, "ZREP_NO_CONFIG=0"}, args: []string{"--profile", "logs", "TODO", fx.path("a.txt")}, wantStdout: "1:7-10\n    alpha TODO one\n"},
+		{name: "bcl default config id", flags: []string{"config-id"}, env: []string{"XDG_CONFIG_HOME=" + fx.xdg, "ZREP_NO_CONFIG=0"}, args: []string{"--config-id", "code", "TODO", fx.root}, wantStdout: "<ROOT>/sub/c.log:1:1-4\n    TODO in log\n"},
+		{name: "bcl missing profile", flags: []string{"profile"}, env: []string{"ZREP_NO_CONFIG=0"}, args: []string{"--config", fx.bclConfig, "--profile", "missing", "TODO", fx.root}, wantExit: 2, wantStderrHas: []string{"config profile \"missing\" not found"}},
 		{name: "text binary", flags: []string{"text"}, args: []string{"-F", "--text", "TODO", fx.path("binary.bin")}, wantStdoutHas: []string{"binary"}},
 		{name: "hidden", flags: []string{"hidden"}, args: []string{"-F", "--hidden", "-c", "TODO", fx.root, "--include", "*.txt", "--sort", "path"}, wantStdoutHas: []string{"<ROOT>/.hidden/secret.txt:1\n"}},
 		{name: "no ignore", flags: []string{"no-ignore"}, args: []string{"-F", "--no-ignore", "-c", "TODO", fx.root, "--include", "*.ignoreme", "--sort", "path"}, wantStdout: "<ROOT>/ignored.ignoreme:1\n"},
@@ -116,8 +133,17 @@ func TestFlagExamples(t *testing.T) {
 		{name: "sort", flags: []string{"sort"}, args: []string{"-F", "-c", "TODO", fx.root, "--include", "*.txt", "--sort", "path"}, wantStdoutHas: []string{"<ROOT>/a.txt:2\n"}},
 		{name: "sortr", flags: []string{"sortr"}, args: []string{"-F", "-c", "TODO", fx.root, "--include", "*.txt", "--sortr", "path"}, wantStdoutHas: []string{"<ROOT>/words.txt:1\n"}},
 		{name: "inspect plain", flags: []string{"inspect"}, args: []string{"--inspect", "--sample", "1", fx.path("data.csv")}, wantStdoutHas: []string{"kind: csv", "rows: 3", "sample:"}},
+		{name: "schema", flags: []string{"schema"}, args: []string{"--schema", fx.path("data.json")}, wantStdoutHas: []string{"user.name string"}},
+		{name: "profile data", flags: []string{"profile-data"}, args: []string{"--profile-data", fx.path("data.csv")}, wantStdoutHas: []string{"rows: 2", "login nulls=0"}},
+		{name: "jq", flags: []string{"jq"}, args: []string{"--jq", ".login==ada", fx.path("data.json")}, wantStdoutHas: []string{`"login":"ada"`}},
+		{name: "sql", flags: []string{"sql"}, args: []string{"--sql", "SELECT id,login WHERE login=bob", fx.path("data.csv")}, wantStdout: "2,bob\n"},
+		{name: "output", flags: []string{"output"}, args: []string{"--inspect", "--sample", "1", "--output", "json", fx.path("data.csv")}, wantStdoutHas: []string{`"kind":"csv"`}},
+		{name: "logs group", flags: []string{"logs", "group-by", "since", "from", "to"}, args: []string{"--logs", "--group-by", "service", "--since", "1000000h", "--from", "2026-01-01", "--to", "2026-12-31", "ERROR", fx.path("logs.txt")}, wantStdout: "api 1\nworker 1\n"},
+		{name: "logs histogram", flags: []string{"histogram"}, args: []string{"--logs", "--histogram", "hour", "ERROR", fx.path("logs.txt")}, wantStdoutHas: []string{"2026-05-01 10:00 2"}},
+		{name: "watch reserved", flags: []string{"watch"}, args: []string{"--watch", "TODO", fx.path("a.txt")}, wantExit: 2, wantStderrHas: []string{"--watch is reserved"}},
+		{name: "tui reserved", flags: []string{"tui"}, args: []string{"--tui", "TODO", fx.path("a.txt")}, wantExit: 2, wantStderrHas: []string{"--tui is reserved"}},
 		{name: "rows columns", flags: []string{"rows", "columns", "R", "K"}, args: []string{"-R", "-K", fx.path("data.csv")}, wantStdoutHas: []string{"rows: 3", "columns: id, login, note"}},
-		{name: "sample limit", flags: []string{"sample", "limit", "N", "L"}, args: []string{"--inspect", "--limit", "1", fx.path("data.json")}, wantStdoutHas: []string{"sample:"}},
+		{name: "sample limit", flags: []string{"sample", "limit", "N"}, args: []string{"--inspect", "--limit", "1", fx.path("data.json")}, wantStdoutHas: []string{"sample:"}},
 		{name: "format json", flags: []string{"format"}, args: []string{"--inspect", "--sample", "1", "--format", "json", fx.path("data.json")}, wantStdoutHas: []string{`"kind":"json"`, `"sample"`}},
 		{name: "format pretty json", flags: []string{"format"}, args: []string{"--inspect", "--sample", "1", "--format", "pretty-json", fx.path("data.json")}, wantStdoutHas: []string{"{\n", "  \"kind\": \"json\""}},
 		{name: "format table", flags: []string{"format"}, args: []string{"--inspect", "--sample", "1", "--format", "table", fx.path("data.csv")}, wantStdoutHas: []string{"sample\n", "id  login"}},
@@ -185,7 +211,7 @@ func TestREADMEFlagCoverage(t *testing.T) {
 			t.Fatalf("README missing flag marker %s", marker)
 		}
 	}
-	for _, name := range []string{"ZREP_CONFIG_PATH", "ZREP_NO_CONFIG", "-", "list-files", "without-match", "matches-count", "all-lines", "cell-width"} {
+	for _, name := range []string{"ZREP_CONFIG_PATH", "ZREP_NO_CONFIG", "ZREP_PROFILE", "-", "list-files", "without-match", "matches-count", "all-lines", "cell-width"} {
 		marker := "<!-- flag:" + name + " -->"
 		if !strings.Contains(readme, marker) {
 			t.Fatalf("README missing feature marker %s", marker)
@@ -222,11 +248,32 @@ func newFlagFixture(t *testing.T) flagFixture {
 	write("data.csv", "id,login,note\n1,ada,TODO csv\n2,bob,plain\n")
 	write("data.json", `[{"id":1,"login":"ada","user":{"name":"Ada"},"note":"TODO json"},{"id":2,"login":"bob","user":{"name":"Bob"},"note":"plain"}]`+"\n")
 	write("data.jsonl", `{"id":1,"login":"ada","note":"TODO jsonl"}`+"\n")
+	write("advanced.txt", "user=42 action=login\nauthorization failed\nfatal timeout happened\n")
+	write("logs.txt", "2026-05-01T10:00:00Z ERROR service=api failed\n2026-05-01T10:30:00Z ERROR service=worker timeout\n2026-05-01T11:00:00Z INFO service=api ok\n")
 	write(".gitignore", "*.ignoreme\n")
+	write("custom.ignore", "a.txt\n")
+	write("real-link-dir/linked.txt", "LINKTODO through symlink\n")
+	if err := os.Symlink(filepath.Join(root, "real-link-dir"), filepath.Join(root, "link-dir")); err == nil {
+		fx.files["link-dir"] = filepath.Join(root, "link-dir")
+	}
 	fx.pattern = filepath.Join(root, "patterns.txt")
 	write("patterns.txt", "TODO\nFIXME\n")
-	fx.config = filepath.Join(root, "zrep.conf")
-	write("zrep.conf", "-F\n--count-matches\n--include 'a.txt'\n")
+	fx.config = filepath.Join(root, "zrep.flags")
+	write("zrep.flags", "-F\n--count-matches\n--include 'a.txt'\n")
+	fx.bclConfig = filepath.Join(root, "zrep.bcl")
+	write("zrep.bcl", `global ["-F", "--sort", "path"]
+profiles {
+  code ["-F", "--glob", "*.log", "--sort", "path"]
+  logs ["-F", "--passthru", "--max-count", "1"]
+}
+`)
+	fx.xdg = filepath.Join(root, "xdg")
+	write("xdg/zrep/config.bcl", `global ["-F", "--sort", "path"]
+profiles {
+  code ["-F", "--glob", "*.log", "--sort", "path"]
+  logs ["-F", "--passthru", "--max-count", "1"]
+}
+`)
 	writeBinary(t, filepath.Join(root, "binary.bin"), []byte("prefix\x00TODO binary\n"))
 	writeUTF16LE(t, filepath.Join(root, "utf16.txt"), "TODO utf16\n")
 	writeGzip(t, filepath.Join(root, "archive.gz"), "GZTODO\n")
@@ -403,7 +450,7 @@ func registeredFlagNames() []string {
 }
 
 func requiredTestedFlags() []string {
-	names := append(registeredFlagNames(), "ZREP_CONFIG_PATH", "ZREP_NO_CONFIG", "-")
+	names := append(registeredFlagNames(), "ZREP_CONFIG_PATH", "ZREP_NO_CONFIG", "ZREP_PROFILE", "-")
 	sort.Strings(names)
 	return names
 }
