@@ -2,6 +2,8 @@
 package searcher
 
 import (
+	"bufio"
+	"bytes"
 	"io"
 	"os"
 	"runtime"
@@ -13,15 +15,22 @@ import (
 
 // Result holds all matches for a single file.
 type Result struct {
-	Path    string
-	Matches []matcher.LineMatch
-	Count   int
-	Err     error
+	Path      string
+	Matches   []matcher.LineMatch
+	OnlyMatch []byte
+	Count     int
+	Err       error
+	Cleanup   func()
 }
 
 // mmap files >= 32KB; use pooled reads for smaller ones to avoid syscall overhead.
 const mmapThreshold = 32 * 1024
 const maxMmapSize = 512 << 20
+
+// MaxBufferedFileSize is the largest file zrep reads as one buffer.
+// Larger files are searched line-by-line so multi-GB and TB-scale files do not
+// require proportional memory.
+const MaxBufferedFileSize = maxMmapSize
 
 var bufPool = sync.Pool{
 	New: func() any {
@@ -32,7 +41,8 @@ var bufPool = sync.Pool{
 
 // Searcher searches files using a Matcher.
 type Searcher struct {
-	m matcher.Matcher
+	m            matcher.Matcher
+	SearchBinary bool
 }
 
 // New creates a Searcher.
@@ -45,30 +55,13 @@ func (s *Searcher) SearchFile(path string, fileSize int64) Result {
 	if fileSize == 0 {
 		return Result{Path: path}
 	}
-
-	var buf []byte
-	var cleanup func()
-	var fromMmap bool
-
-	if fileSize >= mmapThreshold && fileSize <= maxMmapSize && runtime.GOOS != "windows" {
-		b, fn, err := mmapFile(path)
-		if err == nil {
-			buf = b
-			cleanup = fn
-			fromMmap = true
-		}
+	if fileSize > maxMmapSize {
+		return s.searchFileStream(path, false)
 	}
 
-	if !fromMmap {
-		var err error
-		buf, err = readFilePooled(path, fileSize)
-		if err != nil {
-			return Result{Path: path, Err: err}
-		}
-		defer func() {
-			bp := &buf
-			bufPool.Put(bp)
-		}()
+	buf, cleanup, fromMmap, err := readSearchBuffer(path, fileSize)
+	if err != nil {
+		return Result{Path: path, Err: err}
 	}
 
 	// Skip binary files: scan first 8KB for null bytes
@@ -76,8 +69,8 @@ func (s *Searcher) SearchFile(path string, fileSize int64) Result {
 	if len(probe) > 8192 {
 		probe = probe[:8192]
 	}
-	if hasBinaryNull(probe) {
-		if fromMmap {
+	if !s.SearchBinary && hasBinaryNull(probe) {
+		if cleanup != nil {
 			cleanup()
 		}
 		return Result{Path: path}
@@ -88,16 +81,93 @@ func (s *Searcher) SearchFile(path string, fileSize int64) Result {
 	lm, _ = matcher.FindMatchingLines(buf, s.m, 0, lm, mb)
 
 	if fromMmap {
-		// Copy line bytes before munmap; Line slices point into the mapping.
 		for i := range lm {
 			cp := make([]byte, len(lm[i].Line))
 			copy(cp, lm[i].Line)
 			lm[i].Line = cp
 		}
 		cleanup()
+		cleanup = nil
 	}
 
-	return Result{Path: path, Matches: lm}
+	return Result{Path: path, Matches: lm, Cleanup: cleanup}
+}
+
+// SearchFileOnlyLiteral counts exact non-overlapping literal matches for the
+// fast single-pattern -F -o path without extracting line metadata.
+func (s *Searcher) SearchFileOnlyLiteral(path string, fileSize int64, literal string) Result {
+	if fileSize == 0 {
+		return Result{Path: path}
+	}
+	if fileSize > maxMmapSize {
+		return s.searchFileStreamOnlyLiteral(path, literal)
+	}
+
+	buf, cleanup, _, err := readSearchBuffer(path, fileSize)
+	if err != nil {
+		return Result{Path: path, Err: err}
+	}
+	defer cleanup()
+
+	probe := buf
+	if len(probe) > 8192 {
+		probe = probe[:8192]
+	}
+	if !s.SearchBinary && hasBinaryNull(probe) {
+		return Result{Path: path}
+	}
+
+	return Result{Path: path, Count: bytes.Count(buf, []byte(literal)), OnlyMatch: []byte(literal)}
+}
+
+// SearchFileLines searches a file and returns matching lines without match
+// ranges. It is faster for no-color whole-line output.
+func (s *Searcher) SearchFileLines(path string, fileSize int64) Result {
+	if fileSize == 0 {
+		return Result{Path: path}
+	}
+	if fileSize > maxMmapSize {
+		return s.searchFileStreamLines(path, false)
+	}
+
+	buf, cleanup, fromMmap, err := readSearchBuffer(path, fileSize)
+	if err != nil {
+		return Result{Path: path, Err: err}
+	}
+
+	probe := buf
+	if len(probe) > 8192 {
+		probe = probe[:8192]
+	}
+	if !s.SearchBinary && hasBinaryNull(probe) {
+		if cleanup != nil {
+			cleanup()
+		}
+		return Result{Path: path}
+	}
+
+	lm := findMatchingLineOnly(buf, s.m, 0, make([]matcher.LineMatch, 0, 8))
+	if fromMmap {
+		for i := range lm {
+			cp := make([]byte, len(lm[i].Line))
+			copy(cp, lm[i].Line)
+			lm[i].Line = cp
+		}
+		cleanup()
+		cleanup = nil
+	}
+	return Result{Path: path, Matches: lm, Cleanup: cleanup}
+}
+
+// SearchFileChunks streams matching lines for large files and calls emit for
+// each bounded batch. It returns a final Result only for errors.
+func (s *Searcher) SearchFileChunks(path string, invert bool, emit func(Result)) Result {
+	return s.searchFileStreamChunks(path, invert, emit)
+}
+
+// SearchFileLineChunks streams matching lines without match ranges.
+func (s *Searcher) SearchFileLineChunks(path string, invert bool, emit func(Result)) Result {
+	return s.searchFileStreamLineChunks(path, invert, emit)
 }
 
 // SearchFileInvert returns lines that do not match.
@@ -105,23 +175,20 @@ func (s *Searcher) SearchFileInvert(path string, fileSize int64) Result {
 	if fileSize == 0 {
 		return Result{Path: path}
 	}
+	if fileSize > maxMmapSize {
+		return s.searchFileStream(path, true)
+	}
 
 	buf, cleanup, fromMmap, err := readSearchBuffer(path, fileSize)
 	if err != nil {
 		return Result{Path: path, Err: err}
-	}
-	if !fromMmap {
-		defer func() {
-			bp := &buf
-			bufPool.Put(bp)
-		}()
 	}
 
 	probe := buf
 	if len(probe) > 8192 {
 		probe = probe[:8192]
 	}
-	if hasBinaryNull(probe) {
+	if !s.SearchBinary && hasBinaryNull(probe) {
 		if cleanup != nil {
 			cleanup()
 		}
@@ -138,15 +205,19 @@ func (s *Searcher) SearchFileInvert(path string, fileSize int64) Result {
 			lm[i].Line = cp
 		}
 		cleanup()
+		cleanup = nil
 	}
 
-	return Result{Path: path, Matches: lm}
+	return Result{Path: path, Matches: lm, Cleanup: cleanup}
 }
 
 // SearchFileCount counts matching lines without materializing line matches.
 func (s *Searcher) SearchFileCount(path string, fileSize int64) Result {
 	if fileSize == 0 {
 		return Result{Path: path}
+	}
+	if fileSize > maxMmapSize {
+		return s.searchFileStreamCount(path, false)
 	}
 
 	buf, cleanup, fromMmap, err := readSearchBuffer(path, fileSize)
@@ -156,18 +227,13 @@ func (s *Searcher) SearchFileCount(path string, fileSize int64) Result {
 	if cleanup != nil {
 		defer cleanup()
 	}
-	if !fromMmap {
-		defer func() {
-			bp := &buf
-			bufPool.Put(bp)
-		}()
-	}
+	_ = fromMmap
 
 	probe := buf
 	if len(probe) > 8192 {
 		probe = probe[:8192]
 	}
-	if hasBinaryNull(probe) {
+	if !s.SearchBinary && hasBinaryNull(probe) {
 		return Result{Path: path}
 	}
 
@@ -179,6 +245,9 @@ func (s *Searcher) SearchFileCountWords(path string, fileSize int64) Result {
 	if fileSize == 0 {
 		return Result{Path: path}
 	}
+	if fileSize > maxMmapSize {
+		return s.searchFileStreamCountWords(path)
+	}
 
 	buf, cleanup, fromMmap, err := readSearchBuffer(path, fileSize)
 	if err != nil {
@@ -187,18 +256,13 @@ func (s *Searcher) SearchFileCountWords(path string, fileSize int64) Result {
 	if cleanup != nil {
 		defer cleanup()
 	}
-	if !fromMmap {
-		defer func() {
-			bp := &buf
-			bufPool.Put(bp)
-		}()
-	}
+	_ = fromMmap
 
 	probe := buf
 	if len(probe) > 8192 {
 		probe = probe[:8192]
 	}
-	if hasBinaryNull(probe) {
+	if !s.SearchBinary && hasBinaryNull(probe) {
 		return Result{Path: path}
 	}
 
@@ -210,6 +274,9 @@ func (s *Searcher) SearchFileCountByLine(path string, fileSize int64, invert boo
 	if fileSize == 0 {
 		return Result{Path: path}
 	}
+	if fileSize > maxMmapSize {
+		return s.searchFileStreamCount(path, invert)
+	}
 
 	buf, cleanup, fromMmap, err := readSearchBuffer(path, fileSize)
 	if err != nil {
@@ -218,18 +285,13 @@ func (s *Searcher) SearchFileCountByLine(path string, fileSize int64, invert boo
 	if cleanup != nil {
 		defer cleanup()
 	}
-	if !fromMmap {
-		defer func() {
-			bp := &buf
-			bufPool.Put(bp)
-		}()
-	}
+	_ = fromMmap
 
 	probe := buf
 	if len(probe) > 8192 {
 		probe = probe[:8192]
 	}
-	if hasBinaryNull(probe) {
+	if !s.SearchBinary && hasBinaryNull(probe) {
 		return Result{Path: path}
 	}
 
@@ -244,6 +306,9 @@ func (s *Searcher) SearchFileExists(path string, fileSize int64) Result {
 	if fileSize == 0 {
 		return Result{Path: path}
 	}
+	if fileSize > maxMmapSize {
+		return s.searchFileStreamExists(path)
+	}
 
 	buf, cleanup, fromMmap, err := readSearchBuffer(path, fileSize)
 	if err != nil {
@@ -252,18 +317,13 @@ func (s *Searcher) SearchFileExists(path string, fileSize int64) Result {
 	if cleanup != nil {
 		defer cleanup()
 	}
-	if !fromMmap {
-		defer func() {
-			bp := &buf
-			bufPool.Put(bp)
-		}()
-	}
+	_ = fromMmap
 
 	probe := buf
 	if len(probe) > 8192 {
 		probe = probe[:8192]
 	}
-	if hasBinaryNull(probe) {
+	if !s.SearchBinary && hasBinaryNull(probe) {
 		return Result{Path: path}
 	}
 
@@ -272,6 +332,287 @@ func (s *Searcher) SearchFileExists(path string, fileSize int64) Result {
 		return Result{Path: path}
 	}
 	return Result{Path: path, Count: 1}
+}
+
+func (s *Searcher) searchFileStream(path string, invert bool) Result {
+	var all []matcher.LineMatch
+	result := s.searchFileStreamChunks(path, invert, func(r Result) {
+		all = append(all, r.Matches...)
+	})
+	if result.Err != nil {
+		return result
+	}
+	return Result{Path: path, Matches: all}
+}
+
+func (s *Searcher) searchFileStreamLines(path string, invert bool) Result {
+	var all []matcher.LineMatch
+	result := s.searchFileStreamLineChunks(path, invert, func(r Result) {
+		all = append(all, r.Matches...)
+	})
+	if result.Err != nil {
+		return result
+	}
+	return Result{Path: path, Matches: all}
+}
+
+func (s *Searcher) searchFileStreamChunks(path string, invert bool, emit func(Result)) Result {
+	f, err := os.Open(path)
+	if err != nil {
+		return Result{Path: path, Err: err}
+	}
+	defer f.Close()
+
+	r := bufio.NewReaderSize(f, 1<<20)
+	if !s.SearchBinary && streamHasBinaryNull(r) {
+		return Result{Path: path}
+	}
+
+	lm := make([]matcher.LineMatch, 0, 256)
+	matchBuf := make([]matcher.Match, 0, 8)
+	lineNum := 0
+
+	for {
+		line, readErr := r.ReadBytes('\n')
+		if len(line) > 0 {
+			lineNum++
+			line = trimLineBreak(line)
+			matchBuf = matchBuf[:0]
+			matchBuf = s.m.MatchAll(line, matchBuf)
+			if invert {
+				if len(matchBuf) == 0 {
+					lm = append(lm, matcher.LineMatch{LineNum: lineNum, Line: line})
+				}
+			} else if len(matchBuf) > 0 {
+				ms := make([]matcher.Match, len(matchBuf))
+				copy(ms, matchBuf)
+				lm = append(lm, matcher.LineMatch{LineNum: lineNum, Line: line, Matches: ms})
+			}
+			if len(lm) >= 256 {
+				emit(Result{Path: path, Matches: lm, Count: len(lm)})
+				lm = make([]matcher.LineMatch, 0, 256)
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return Result{Path: path, Err: readErr}
+		}
+	}
+	if len(lm) > 0 {
+		emit(Result{Path: path, Matches: lm, Count: len(lm)})
+	}
+	return Result{Path: path}
+}
+
+func (s *Searcher) searchFileStreamLineChunks(path string, invert bool, emit func(Result)) Result {
+	f, err := os.Open(path)
+	if err != nil {
+		return Result{Path: path, Err: err}
+	}
+	defer f.Close()
+
+	r := bufio.NewReaderSize(f, 1<<20)
+	if !s.SearchBinary && streamHasBinaryNull(r) {
+		return Result{Path: path}
+	}
+
+	lm := make([]matcher.LineMatch, 0, 256)
+	lineNum := 0
+
+	for {
+		line, readErr := r.ReadBytes('\n')
+		if len(line) > 0 {
+			lineNum++
+			line = trimLineBreak(line)
+			start, _ := s.m.Match(line)
+			if invert && start < 0 || !invert && start >= 0 {
+				lm = append(lm, matcher.LineMatch{LineNum: lineNum, Line: line})
+			}
+			if len(lm) >= 256 {
+				emit(Result{Path: path, Matches: lm, Count: len(lm)})
+				lm = make([]matcher.LineMatch, 0, 256)
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return Result{Path: path, Err: readErr}
+		}
+	}
+	if len(lm) > 0 {
+		emit(Result{Path: path, Matches: lm, Count: len(lm)})
+	}
+	return Result{Path: path}
+}
+
+func (s *Searcher) searchFileStreamCount(path string, invert bool) Result {
+	f, err := os.Open(path)
+	if err != nil {
+		return Result{Path: path, Err: err}
+	}
+	defer f.Close()
+
+	r := bufio.NewReaderSize(f, 1<<20)
+	if !s.SearchBinary && streamHasBinaryNull(r) {
+		return Result{Path: path}
+	}
+
+	count := 0
+	for {
+		line, readErr := r.ReadBytes('\n')
+		if len(line) > 0 {
+			line = trimLineBreak(line)
+			start, _ := s.m.Match(line)
+			if invert && start < 0 || !invert && start >= 0 {
+				count++
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return Result{Path: path, Err: readErr}
+		}
+	}
+	return Result{Path: path, Count: count}
+}
+
+func (s *Searcher) searchFileStreamCountWords(path string) Result {
+	f, err := os.Open(path)
+	if err != nil {
+		return Result{Path: path, Err: err}
+	}
+	defer f.Close()
+
+	r := bufio.NewReaderSize(f, 1<<20)
+	if !s.SearchBinary && streamHasBinaryNull(r) {
+		return Result{Path: path}
+	}
+
+	count := 0
+	for {
+		line, readErr := r.ReadBytes('\n')
+		if len(line) > 0 {
+			line = trimLineBreak(line)
+			count += matcher.CountMatchingWordLines(line, s.m)
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return Result{Path: path, Err: readErr}
+		}
+	}
+	return Result{Path: path, Count: count}
+}
+
+func (s *Searcher) searchFileStreamOnlyLiteral(path, literal string) Result {
+	f, err := os.Open(path)
+	if err != nil {
+		return Result{Path: path, Err: err}
+	}
+	defer f.Close()
+
+	r := bufio.NewReaderSize(f, 1<<20)
+	if !s.SearchBinary && streamHasBinaryNull(r) {
+		return Result{Path: path}
+	}
+
+	needle := []byte(literal)
+	count := 0
+	for {
+		line, readErr := r.ReadBytes('\n')
+		if len(line) > 0 {
+			count += bytes.Count(line, needle)
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return Result{Path: path, Err: readErr}
+		}
+	}
+	return Result{Path: path, Count: count, OnlyMatch: needle}
+}
+
+func (s *Searcher) searchFileStreamExists(path string) Result {
+	f, err := os.Open(path)
+	if err != nil {
+		return Result{Path: path, Err: err}
+	}
+	defer f.Close()
+
+	r := bufio.NewReaderSize(f, 1<<20)
+	if !s.SearchBinary && streamHasBinaryNull(r) {
+		return Result{Path: path}
+	}
+
+	for {
+		line, readErr := r.ReadBytes('\n')
+		if len(line) > 0 {
+			line = trimLineBreak(line)
+			start, _ := s.m.Match(line)
+			if start >= 0 {
+				return Result{Path: path, Count: 1}
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return Result{Path: path, Err: readErr}
+		}
+	}
+	return Result{Path: path}
+}
+
+func trimLineBreak(line []byte) []byte {
+	if len(line) > 0 && line[len(line)-1] == '\n' {
+		line = line[:len(line)-1]
+	}
+	if len(line) > 0 && line[len(line)-1] == '\r' {
+		line = line[:len(line)-1]
+	}
+	return line
+}
+
+func streamHasBinaryNull(r *bufio.Reader) bool {
+	probe, err := r.Peek(8192)
+	if err != nil && len(probe) == 0 {
+		return false
+	}
+	return hasBinaryNull(probe)
+}
+
+func findMatchingLineOnly(buf []byte, m matcher.Matcher, lineOffset int, dst []matcher.LineMatch) []matcher.LineMatch {
+	lineStart := 0
+	lineNum := lineOffset
+
+	for lineStart <= len(buf) {
+		lineEnd := lineStart
+		for lineEnd < len(buf) && buf[lineEnd] != '\n' {
+			lineEnd++
+		}
+
+		line := buf[lineStart:lineEnd]
+		start, _ := m.Match(line)
+		if start >= 0 {
+			dst = append(dst, matcher.LineMatch{
+				LineNum: lineNum + 1,
+				Line:    line,
+			})
+		}
+
+		lineNum++
+		if lineEnd >= len(buf) {
+			break
+		}
+		lineStart = lineEnd + 1
+	}
+	return dst
 }
 
 func readSearchBuffer(path string, fileSize int64) ([]byte, func(), bool, error) {
@@ -286,7 +627,10 @@ func readSearchBuffer(path string, fileSize int64) ([]byte, func(), bool, error)
 	if err != nil {
 		return nil, nil, false, err
 	}
-	return buf, nil, false, nil
+	return buf, func() {
+		bp := &buf
+		bufPool.Put(bp)
+	}, false, nil
 }
 
 func mmapFile(path string) ([]byte, func(), error) {

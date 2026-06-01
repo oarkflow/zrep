@@ -28,12 +28,21 @@ var DefaultFilter Filter = func(path string, d fs.DirEntry) bool {
 	if name[0] == '.' {
 		return false
 	}
-	switch name {
-	case "node_modules", "vendor", "target", ".git", ".hg", ".svn",
-		"__pycache__", ".mypy_cache", "dist", "build", ".cache":
+	if IsDefaultIgnoredName(name) {
 		return false
 	}
 	return true
+}
+
+// IsDefaultIgnoredName reports whether name is one of the noisy directories
+// skipped by zrep unless -hidden or -no-default-ignore is set.
+func IsDefaultIgnoredName(name string) bool {
+	switch name {
+	case "node_modules", "vendor", "target", ".git", ".hg", ".svn",
+		"__pycache__", ".mypy_cache", "dist", "build", ".cache":
+		return true
+	}
+	return false
 }
 
 // Walker walks directories in parallel.

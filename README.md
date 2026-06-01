@@ -4,6 +4,8 @@
 
 The current focus is a fast common core: fixed-string search, regex search, count mode, file listing, line numbers, only-matching output, invert match, repeated patterns, whole-word matching, and whole-line matching.
 
+Large files are streamed line-by-line after the buffered/mmap threshold, so files in the multi-GB or TB range do not need to fit in memory. Matching output for large files is emitted in bounded chunks.
+
 ## Build
 
 ```sh
@@ -30,6 +32,9 @@ zrep -n 'func [A-Za-z]+' .
 zrep -F -i -w error logs
 zrep -F -o -e TODO -e FIXME .
 zrep -F -v generated .
+zrep -F -include '*.go' TODO .
+zrep -F -include-dir internal -exclude-dir vendor TODO .
+zrep -F -hidden -text NEEDLE dumps
 ```
 
 ## Supported Flags
@@ -51,6 +56,13 @@ zrep -F -v generated .
 -j N        parallel workers; 0 = GOMAXPROCS*2
 -cpuprofile FILE
 -stats
+-text       search binary files as text
+-hidden     search hidden files and directories
+-no-default-ignore
+-include GLOB      include only files matching glob; repeatable
+-exclude GLOB      exclude files or directories matching glob; repeatable
+-include-dir GLOB  include only files under matching directories; repeatable
+-exclude-dir GLOB  exclude directories matching glob; repeatable
 ```
 
 ## Benchmarks
@@ -75,11 +87,16 @@ invert count
 whole-word count
 whole-line count
 multi-pattern count
+include glob count
+exclude glob count
+include-dir count
+exclude-dir count
+hidden count
+binary-as-text count
 ```
 
 ## Notes
 
-`zrep` is not full ripgrep parity yet. Ripgrep supports a much larger surface area, including ignore-file semantics, globs, type filters, encodings, multiline search, JSON output, PCRE2, replacements, and context modes.
+`zrep` is not full ripgrep parity yet. Ripgrep supports a much larger surface area, including ignore-file semantics, type filters, encodings, multiline search, JSON output, PCRE2, replacements, and context modes.
 
 This project is currently optimizing the core search pipeline first.
-

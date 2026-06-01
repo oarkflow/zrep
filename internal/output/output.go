@@ -76,12 +76,21 @@ func (p *Printer) run() {
 	for r := range p.in {
 		if r.Err != nil {
 			fmt.Fprintf(p.bw, "error: %s: %v\n", r.Path, r.Err)
+			if r.Cleanup != nil {
+				r.Cleanup()
+			}
 			continue
 		}
-		if len(r.Matches) == 0 && r.Count == 0 {
+		if len(r.Matches) == 0 && len(r.OnlyMatch) == 0 && r.Count == 0 {
+			if r.Cleanup != nil {
+				r.Cleanup()
+			}
 			continue
 		}
 		p.printResult(r)
+		if r.Cleanup != nil {
+			r.Cleanup()
+		}
 	}
 }
 
@@ -106,8 +115,30 @@ func (p *Printer) printResult(r searcher.Result) {
 			writeFilename(w, r.Path, o.Color)
 			w.WriteByte(':')
 		}
-		w.WriteString(strconv.Itoa(r.Count))
+		writeInt(w, r.Count)
 		w.WriteByte('\n')
+		return
+	}
+
+	if o.OnlyMatching && len(r.OnlyMatch) > 0 {
+		if !o.Color && !o.LineNumbers {
+			line := make([]byte, 0, len(r.Path)+len(r.OnlyMatch)+2)
+			if !o.NoFilename {
+				line = append(line, r.Path...)
+				line = append(line, ':')
+			}
+			line = append(line, r.OnlyMatch...)
+			line = append(line, '\n')
+			for i := 0; i < r.Count; i++ {
+				w.Write(line)
+			}
+			return
+		}
+		for i := 0; i < r.Count; i++ {
+			p.writePrefix(r.Path, 0)
+			w.Write(r.OnlyMatch)
+			w.WriteByte('\n')
+		}
 		return
 	}
 
@@ -139,12 +170,17 @@ func (p *Printer) writePrefix(path string, lineNum int) {
 		if o.Color {
 			w.WriteString(colorCyan)
 		}
-		w.WriteString(strconv.Itoa(lineNum))
+		writeInt(w, lineNum)
 		if o.Color {
 			w.WriteString(colorReset)
 		}
 		w.WriteByte(':')
 	}
+}
+
+func writeInt(w *bufio.Writer, n int) {
+	var buf [20]byte
+	w.Write(strconv.AppendInt(buf[:0], int64(n), 10))
 }
 
 func writeFilename(w *bufio.Writer, path string, color bool) {

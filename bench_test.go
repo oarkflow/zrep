@@ -79,13 +79,43 @@ func BenchmarkZrepVsRipgrep(b *testing.B) {
 		},
 		{
 			name:     "line-count",
-			zrepArgs: []string{"-F", "-x", "-c", "-no-color", "file=000 line=0000 marker=ZREP_NEEDLE alpha beta gamma delta epsilon", corpus.dir},
-			rgArgs:   []string{"--fixed-strings", "--line-regexp", "--count", "--color=never", "--no-messages", "--no-ignore", "file=000 line=0000 marker=ZREP_NEEDLE alpha beta gamma delta epsilon", corpus.dir},
+			zrepArgs: []string{"-F", "-x", "-c", "-no-color", "file=001 line=0256 marker=ZREP_NEEDLE alpha beta gamma delta epsilon", corpus.dir},
+			rgArgs:   []string{"--fixed-strings", "--line-regexp", "--count", "--color=never", "--no-messages", "--no-ignore", "file=001 line=0256 marker=ZREP_NEEDLE alpha beta gamma delta epsilon", corpus.dir},
 		},
 		{
 			name:     "multi-pattern-count",
 			zrepArgs: []string{"-F", "-c", "-no-color", "-e", benchPattern, "-e", "theta", corpus.dir},
 			rgArgs:   []string{"--fixed-strings", "--count", "--color=never", "--no-messages", "--no-ignore", "-e", benchPattern, "-e", "theta", corpus.dir},
+		},
+		{
+			name:     "include-glob-count",
+			zrepArgs: []string{"-F", "-c", "-no-color", "-include", "*.log", benchPattern, corpus.dir},
+			rgArgs:   []string{"--fixed-strings", "--count", "--color=never", "--no-messages", "--no-ignore", "--glob", "*.log", benchPattern, corpus.dir},
+		},
+		{
+			name:     "exclude-glob-count",
+			zrepArgs: []string{"-F", "-c", "-no-color", "-exclude", "*.skip", benchPattern, corpus.dir},
+			rgArgs:   []string{"--fixed-strings", "--count", "--color=never", "--no-messages", "--no-ignore", "--glob", "!*.skip", benchPattern, corpus.dir},
+		},
+		{
+			name:     "include-dir-count",
+			zrepArgs: []string{"-F", "-c", "-no-color", "-include-dir", "src", benchPattern, corpus.dir},
+			rgArgs:   []string{"--fixed-strings", "--count", "--color=never", "--no-messages", "--no-ignore", "--glob", "**/src/**", benchPattern, corpus.dir},
+		},
+		{
+			name:     "exclude-dir-count",
+			zrepArgs: []string{"-F", "-c", "-no-color", "-exclude-dir", "generated", benchPattern, corpus.dir},
+			rgArgs:   []string{"--fixed-strings", "--count", "--color=never", "--no-messages", "--no-ignore", "--glob", "!**/generated/**", benchPattern, corpus.dir},
+		},
+		{
+			name:     "hidden-count",
+			zrepArgs: []string{"-F", "-c", "-no-color", "-hidden", benchPattern, corpus.dir},
+			rgArgs:   []string{"--fixed-strings", "--count", "--color=never", "--no-messages", "--no-ignore", "--hidden", benchPattern, corpus.dir},
+		},
+		{
+			name:     "binary-as-text-count",
+			zrepArgs: []string{"-F", "-c", "-no-color", "-text", benchPattern, corpus.dir},
+			rgArgs:   []string{"--fixed-strings", "--count", "--color=never", "--no-messages", "--no-ignore", "--text", benchPattern, corpus.dir},
 		},
 	}
 
@@ -146,6 +176,16 @@ func createBenchCorpus(tb testing.TB) benchCorpus {
 	)
 
 	var total int64
+	subdirs := []string{"src", "generated", "logs"}
+	for _, subdir := range subdirs {
+		if err := os.MkdirAll(filepath.Join(dir, subdir), 0o755); err != nil {
+			tb.Fatalf("create benchmark corpus directory: %v", err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(dir, ".hidden"), 0o755); err != nil {
+		tb.Fatalf("create hidden benchmark corpus directory: %v", err)
+	}
+
 	for fileIdx := 0; fileIdx < files; fileIdx++ {
 		var buf bytes.Buffer
 		buf.Grow(linesPerFile * 96)
@@ -158,12 +198,30 @@ func createBenchCorpus(tb testing.TB) benchCorpus {
 			fmt.Fprintf(&buf, "file=%03d line=%04d alpha beta gamma delta epsilon theta lambda sigma\n", fileIdx, lineIdx)
 		}
 
-		path := filepath.Join(dir, fmt.Sprintf("bench-%03d.txt", fileIdx))
+		subdir := subdirs[fileIdx%len(subdirs)]
+		ext := ".txt"
+		if fileIdx%4 == 0 {
+			ext = ".log"
+		}
+		if fileIdx%7 == 0 {
+			ext = ".skip"
+		}
+		if fileIdx%31 == 0 {
+			subdir = ".hidden"
+		}
+		path := filepath.Join(dir, subdir, fmt.Sprintf("bench-%03d%s", fileIdx, ext))
 		if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
 			tb.Fatalf("write benchmark corpus file: %v", err)
 		}
 		total += int64(buf.Len())
 	}
+
+	binaryPath := filepath.Join(dir, "logs", "bench-binary.bin")
+	binaryData := append([]byte("prefix\x00"), []byte(benchPattern+"\n")...)
+	if err := os.WriteFile(binaryPath, binaryData, 0o644); err != nil {
+		tb.Fatalf("write benchmark binary corpus file: %v", err)
+	}
+	total += int64(len(binaryData))
 
 	return benchCorpus{dir: dir, bytes: total}
 }
