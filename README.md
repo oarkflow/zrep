@@ -21,6 +21,16 @@ zrep [flags] -e PATTERN [-e PATTERN...] [PATH...]
 
 If no path is provided, `zrep` searches the current directory.
 
+Normal match output is block-oriented. The location line uses
+`path:line:start-column[-end-column]` so terminals and editors can Ctrl-click
+the `path:line:column` portion, and the matching content is printed indented on
+the next line.
+
+```text
+internal/matcher/matcher_test.go:36:48-51
+    var corpus = generateCorpus(100_000, 80, 100, "TODO")
+```
+
 Examples:
 
 ```sh

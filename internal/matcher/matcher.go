@@ -318,6 +318,7 @@ func popcount8(x uint64) int {
 type regexMatcher struct {
 	re      *regexp.Regexp
 	literal string // non-empty if pattern is a pure literal
+	prefix  string // non-empty if regexp has a required literal prefix
 	lit     Matcher
 }
 
@@ -334,15 +335,26 @@ func NewRegex(pattern string, ignoreCase bool) (Matcher, error) {
 	if err != nil {
 		return nil, err
 	}
+	prefix, _ := re.LiteralPrefix()
 
 	// Check if it's a pure literal (no metacharacters)
 	parsed, _ := syntax.Parse(pattern, syntax.Perl)
 	if parsed != nil && isLiteral(parsed) {
 		lit := NewLiteral(pattern, ignoreCase)
-		return &regexMatcher{re: re, literal: pattern, lit: lit}, nil
+		return &regexMatcher{re: re, literal: pattern, prefix: prefix, lit: lit}, nil
 	}
 
-	return &regexMatcher{re: re}, nil
+	return &regexMatcher{re: re, prefix: prefix}, nil
+}
+
+// LiteralPrefix returns a required case-sensitive literal prefix when the
+// matcher can expose one cheaply.
+func LiteralPrefix(m Matcher) (string, bool) {
+	rm, ok := m.(*regexMatcher)
+	if !ok || rm.prefix == "" {
+		return "", false
+	}
+	return rm.prefix, true
 }
 
 func isLiteral(re *syntax.Regexp) bool {

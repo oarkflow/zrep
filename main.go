@@ -179,11 +179,7 @@ Flags:
 						}
 					}
 					var r searcher.Result
-					if !colorEnabled && !*flagOnlyMatches {
-						r = s.SearchFileLineChunks(entry.Path, *flagInvert, emit)
-					} else {
-						r = s.SearchFileChunks(entry.Path, *flagInvert, emit)
-					}
+					r = s.SearchFileChunks(entry.Path, *flagInvert, emit)
 					if r.Err != nil {
 						printer.Send(r)
 					}
@@ -193,7 +189,9 @@ Flags:
 				if *flagOnlyFiles && fixedFast && !*flagInvert {
 					r = s.SearchFileExists(entry.Path, entry.Info.Size())
 				} else if *flagCount {
-					if fixedFast && len(patterns) == 1 && !*flagInvert {
+					if *flagFixed && *flagLine && !*flagIgnoreCase && len(patterns) == 1 && !*flagInvert {
+						r = s.SearchFileCountExactLine(entry.Path, entry.Info.Size(), patterns[0])
+					} else if fixedFast && len(patterns) == 1 && !*flagInvert {
 						r = s.SearchFileCount(entry.Path, entry.Info.Size())
 					} else if fixedWordFast && !*flagInvert {
 						r = s.SearchFileCountWords(entry.Path, entry.Info.Size())
@@ -270,6 +268,7 @@ func buildPathFilter() walker.Filter {
 	excludeFiles := []string(flagExcludes)
 	includeDirs := []string(flagIncludeDirs)
 	excludeDirs := []string(flagExcludeDirs)
+	cwd, _ := os.Getwd()
 
 	return func(path string, d fs.DirEntry) bool {
 		name := d.Name()
@@ -281,30 +280,30 @@ func buildPathFilter() walker.Filter {
 		}
 
 		if d.IsDir() {
-			return !matchesAnyPathGlob(path, name, excludeDirs) &&
-				!matchesAnyPathGlob(path, name, excludeFiles)
+			return !matchesAnyPathGlob(path, name, excludeDirs, cwd) &&
+				!matchesAnyPathGlob(path, name, excludeFiles, cwd)
 		}
 
-		if len(includeDirs) > 0 && !pathHasMatchingDir(path, includeDirs) {
+		if len(includeDirs) > 0 && !pathHasMatchingDir(path, includeDirs, cwd) {
 			return false
 		}
-		if matchesAnyPathGlob(path, name, excludeFiles) {
+		if matchesAnyPathGlob(path, name, excludeFiles, cwd) {
 			return false
 		}
-		if len(includeFiles) > 0 && !matchesAnyPathGlob(path, name, includeFiles) {
+		if len(includeFiles) > 0 && !matchesAnyPathGlob(path, name, includeFiles, cwd) {
 			return false
 		}
 		return true
 	}
 }
 
-func pathHasMatchingDir(path string, patterns []string) bool {
+func pathHasMatchingDir(path string, patterns []string, cwd string) bool {
 	dir := filepath.Dir(filepath.Clean(path))
 	for {
 		if dir == "." || dir == string(filepath.Separator) || dir == "" {
 			return false
 		}
-		if matchesAnyPathGlob(dir, filepath.Base(dir), patterns) {
+		if matchesAnyPathGlob(dir, filepath.Base(dir), patterns, cwd) {
 			return true
 		}
 		next := filepath.Dir(dir)
@@ -315,16 +314,16 @@ func pathHasMatchingDir(path string, patterns []string) bool {
 	}
 }
 
-func matchesAnyPathGlob(path, name string, patterns []string) bool {
+func matchesAnyPathGlob(path, name string, patterns []string, cwd string) bool {
 	for _, pattern := range patterns {
-		if matchesPathGlob(path, name, pattern) {
+		if matchesPathGlob(path, name, pattern, cwd) {
 			return true
 		}
 	}
 	return false
 }
 
-func matchesPathGlob(path, name, pattern string) bool {
+func matchesPathGlob(path, name, pattern, cwd string) bool {
 	if pattern == "" {
 		return false
 	}
@@ -338,11 +337,10 @@ func matchesPathGlob(path, name, pattern string) bool {
 	if !filepath.IsAbs(cleanPath) {
 		return false
 	}
-	if wd, err := os.Getwd(); err == nil {
-		if rel, err := filepath.Rel(wd, cleanPath); err == nil {
-			if ok, _ := filepath.Match(pattern, rel); ok {
-				return true
-			}
+	if cwd != "" {
+		if rel, err := filepath.Rel(cwd, cleanPath); err == nil {
+			ok, _ := filepath.Match(pattern, rel)
+			return ok || strings.Contains(pattern, string(filepath.Separator)) && strings.Contains(cleanPath, pattern)
 		}
 	}
 	return strings.Contains(pattern, string(filepath.Separator)) && strings.Contains(cleanPath, pattern)

@@ -151,9 +151,8 @@ func (p *Printer) printResult(r searcher.Result) {
 			}
 			continue
 		}
-		// Filename prefix
-		p.writePrefix(r.Path, lm.LineNum)
-		// Line content with highlighted matches
+		p.writeLocation(r.Path, lm)
+		w.WriteString("    ")
 		writeLineHighlighted(w, lm.Line, lm.Matches, o.Color)
 		w.WriteByte('\n')
 	}
@@ -181,6 +180,48 @@ func (p *Printer) writePrefix(path string, lineNum int) {
 func writeInt(w *bufio.Writer, n int) {
 	var buf [20]byte
 	w.Write(strconv.AppendInt(buf[:0], int64(n), 10))
+}
+
+func (p *Printer) writeLocation(path string, lm matcher.LineMatch) {
+	w := p.bw
+	if !p.opts.NoFilename {
+		writeFilename(w, path, p.opts.Color)
+		w.WriteByte(':')
+	}
+	if p.opts.Color {
+		w.WriteString(colorCyan)
+	}
+	writeInt(w, lm.LineNum)
+	if p.opts.Color {
+		w.WriteString(colorReset)
+	}
+	w.WriteByte(':')
+	startCol, endCol := matchColumns(lm)
+	if p.opts.Color {
+		w.WriteString(colorYellow)
+	}
+	writeInt(w, startCol)
+	if endCol > startCol {
+		w.WriteByte('-')
+		writeInt(w, endCol)
+	}
+	if p.opts.Color {
+		w.WriteString(colorReset)
+	}
+	w.WriteByte('\n')
+}
+
+func matchColumns(lm matcher.LineMatch) (int, int) {
+	if len(lm.Matches) == 0 {
+		return 1, 1
+	}
+	first := lm.Matches[0]
+	start := first.Start + 1
+	end := first.End
+	if end < start {
+		end = start
+	}
+	return start, end
 }
 
 func writeFilename(w *bufio.Writer, path string, color bool) {

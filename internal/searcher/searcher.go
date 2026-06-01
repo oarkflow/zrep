@@ -59,7 +59,7 @@ func (s *Searcher) SearchFile(path string, fileSize int64) Result {
 		return s.searchFileStream(path, false)
 	}
 
-	buf, cleanup, fromMmap, err := readSearchBuffer(path, fileSize)
+	buf, cleanup, _, err := readSearchBuffer(path, fileSize)
 	if err != nil {
 		return Result{Path: path, Err: err}
 	}
@@ -80,12 +80,8 @@ func (s *Searcher) SearchFile(path string, fileSize int64) Result {
 	mb := make([]matcher.Match, 0, 8)
 	lm, _ = matcher.FindMatchingLines(buf, s.m, 0, lm, mb)
 
-	if fromMmap {
-		for i := range lm {
-			cp := make([]byte, len(lm[i].Line))
-			copy(cp, lm[i].Line)
-			lm[i].Line = cp
-		}
+	if cleanup != nil {
+		copyLineMatches(lm)
 		cleanup()
 		cleanup = nil
 	}
@@ -130,7 +126,7 @@ func (s *Searcher) SearchFileLines(path string, fileSize int64) Result {
 		return s.searchFileStreamLines(path, false)
 	}
 
-	buf, cleanup, fromMmap, err := readSearchBuffer(path, fileSize)
+	buf, cleanup, _, err := readSearchBuffer(path, fileSize)
 	if err != nil {
 		return Result{Path: path, Err: err}
 	}
@@ -147,12 +143,8 @@ func (s *Searcher) SearchFileLines(path string, fileSize int64) Result {
 	}
 
 	lm := findMatchingLineOnly(buf, s.m, 0, make([]matcher.LineMatch, 0, 8))
-	if fromMmap {
-		for i := range lm {
-			cp := make([]byte, len(lm[i].Line))
-			copy(cp, lm[i].Line)
-			lm[i].Line = cp
-		}
+	if cleanup != nil {
+		copyLineMatches(lm)
 		cleanup()
 		cleanup = nil
 	}
@@ -179,7 +171,7 @@ func (s *Searcher) SearchFileInvert(path string, fileSize int64) Result {
 		return s.searchFileStream(path, true)
 	}
 
-	buf, cleanup, fromMmap, err := readSearchBuffer(path, fileSize)
+	buf, cleanup, _, err := readSearchBuffer(path, fileSize)
 	if err != nil {
 		return Result{Path: path, Err: err}
 	}
@@ -198,12 +190,8 @@ func (s *Searcher) SearchFileInvert(path string, fileSize int64) Result {
 	lm := make([]matcher.LineMatch, 0, 8)
 	lm = matcher.FindNonMatchingLines(buf, s.m, 0, lm)
 
-	if fromMmap {
-		for i := range lm {
-			cp := make([]byte, len(lm[i].Line))
-			copy(cp, lm[i].Line)
-			lm[i].Line = cp
-		}
+	if cleanup != nil {
+		copyLineMatches(lm)
 		cleanup()
 		cleanup = nil
 	}
@@ -269,6 +257,33 @@ func (s *Searcher) SearchFileCountWords(path string, fileSize int64) Result {
 	return Result{Path: path, Count: matcher.CountMatchingWordLines(buf, s.m)}
 }
 
+// SearchFileCountExactLine counts lines exactly equal to literal.
+func (s *Searcher) SearchFileCountExactLine(path string, fileSize int64, literal string) Result {
+	if fileSize == 0 {
+		return Result{Path: path}
+	}
+	needle := []byte(literal)
+	if fileSize > maxMmapSize {
+		return s.searchFileStreamCountExactLine(path, needle)
+	}
+
+	buf, cleanup, _, err := readSearchBuffer(path, fileSize)
+	if err != nil {
+		return Result{Path: path, Err: err}
+	}
+	defer cleanup()
+
+	probe := buf
+	if len(probe) > 8192 {
+		probe = probe[:8192]
+	}
+	if !s.SearchBinary && hasBinaryNull(probe) {
+		return Result{Path: path}
+	}
+
+	return Result{Path: path, Count: countExactLine(buf, needle)}
+}
+
 // SearchFileCountByLine counts matching lines with line-scoped regex semantics.
 func (s *Searcher) SearchFileCountByLine(path string, fileSize int64, invert bool) Result {
 	if fileSize == 0 {
@@ -297,6 +312,9 @@ func (s *Searcher) SearchFileCountByLine(path string, fileSize int64, invert boo
 
 	if invert {
 		return Result{Path: path, Count: matcher.CountNonMatchingLinesByLine(buf, s.m)}
+	}
+	if prefix, ok := matcher.LiteralPrefix(s.m); ok {
+		return Result{Path: path, Count: countMatchingLinesByPrefix(buf, s.m, []byte(prefix))}
 	}
 	return Result{Path: path, Count: matcher.CountMatchingLinesByLine(buf, s.m)}
 }
@@ -509,6 +527,37 @@ func (s *Searcher) searchFileStreamCountWords(path string) Result {
 	return Result{Path: path, Count: count}
 }
 
+func (s *Searcher) searchFileStreamCountExactLine(path string, needle []byte) Result {
+	f, err := os.Open(path)
+	if err != nil {
+		return Result{Path: path, Err: err}
+	}
+	defer f.Close()
+
+	r := bufio.NewReaderSize(f, 1<<20)
+	if !s.SearchBinary && streamHasBinaryNull(r) {
+		return Result{Path: path}
+	}
+
+	count := 0
+	for {
+		line, readErr := r.ReadBytes('\n')
+		if len(line) > 0 {
+			line = trimLineBreak(line)
+			if bytes.Equal(line, needle) {
+				count++
+			}
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return Result{Path: path, Err: readErr}
+		}
+	}
+	return Result{Path: path, Count: count}
+}
+
 func (s *Searcher) searchFileStreamOnlyLiteral(path, literal string) Result {
 	f, err := os.Open(path)
 	if err != nil {
@@ -613,6 +662,70 @@ func findMatchingLineOnly(buf []byte, m matcher.Matcher, lineOffset int, dst []m
 		lineStart = lineEnd + 1
 	}
 	return dst
+}
+
+func copyLineMatches(matches []matcher.LineMatch) {
+	for i := range matches {
+		cp := make([]byte, len(matches[i].Line))
+		copy(cp, matches[i].Line)
+		matches[i].Line = cp
+	}
+}
+
+func countMatchingLinesByPrefix(buf []byte, m matcher.Matcher, prefix []byte) int {
+	if len(prefix) == 0 {
+		return matcher.CountMatchingLinesByLine(buf, m)
+	}
+
+	count := 0
+	offset := 0
+	for offset < len(buf) {
+		idx := bytes.Index(buf[offset:], prefix)
+		if idx < 0 {
+			break
+		}
+		candidate := offset + idx
+		lineStart := candidate
+		for lineStart > 0 && buf[lineStart-1] != '\n' {
+			lineStart--
+		}
+		lineEnd := candidate + len(prefix)
+		for lineEnd < len(buf) && buf[lineEnd] != '\n' {
+			lineEnd++
+		}
+
+		if start, _ := m.Match(buf[lineStart:lineEnd]); start >= 0 {
+			count++
+			offset = lineEnd + 1
+			continue
+		}
+		offset = candidate + 1
+	}
+	return count
+}
+
+func countExactLine(buf, needle []byte) int {
+	count := 0
+	lineStart := 0
+	for lineStart <= len(buf) {
+		lineEndRel := bytes.IndexByte(buf[lineStart:], '\n')
+		lineEnd := len(buf)
+		if lineEndRel >= 0 {
+			lineEnd = lineStart + lineEndRel
+		}
+		line := buf[lineStart:lineEnd]
+		if len(line) > 0 && line[len(line)-1] == '\r' {
+			line = line[:len(line)-1]
+		}
+		if bytes.Equal(line, needle) {
+			count++
+		}
+		if lineEndRel < 0 {
+			break
+		}
+		lineStart = lineEnd + 1
+	}
+	return count
 }
 
 func readSearchBuffer(path string, fileSize int64) ([]byte, func(), bool, error) {
